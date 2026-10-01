@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_DB: sonar
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:-}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonar"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  sonarqube:
+    image: sonarqube:26.9.0.129388-community@sha256:4905574ab8584dcac1a06c01cdc43a4ce9e369723ac4a7ab1d029c1bf71e6fe9
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${SONAR_PORT:-9000}:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+      nproc:
+        soft: 8192
+        hard: 8192
+    restart: unless-stopped
+
+  tools:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "${SONAR_UID:-1000}:${SONAR_GID:-1000}"
+    environment:
+      SONAR_PORT: ${SONAR_PORT:-9000}
+      SONAR_STARTUP_TIMEOUT: ${SONAR_STARTUP_TIMEOUT:-300}
+      SONAR_ANALYSIS_TIMEOUT: ${SONAR_ANALYSIS_TIMEOUT:-300}
+      SONAR_SCAN_TIMEOUT: ${SONAR_SCAN_TIMEOUT:-1800}
+      SONAR_STATE_DIR: /state
+      SONAR_PROJECTS_DIR: /projects
+      SONAR_CONFIG_DIR: /config
+    volumes:
+      - ./.state:/state
+      - ./projects:/projects:ro
+      - ./config:/config:ro
+    init: true
+    command: ["status"]
+
+volumes:
+  postgres_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:

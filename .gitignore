@@ -1,0 +1,7 @@
+.state/
+projects/*
+!projects/.gitkeep
+config/projects/*.properties
+__pycache__/
+*.py[cod]
+.DS_Store

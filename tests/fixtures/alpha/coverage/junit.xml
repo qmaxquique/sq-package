@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Fixture suite" tests="1" failures="0" errors="0" time="0.01">
+  <testsuite name="CalculatorTest" file="tests/CalculatorTest.php" tests="1" failures="0" errors="0" time="0.01">
+    <testcase name="testAdd" class="CalculatorTest" classname="CalculatorTest" file="tests/CalculatorTest.php" line="9" time="0.01"/>
+  </testsuite>
+</testsuites>
