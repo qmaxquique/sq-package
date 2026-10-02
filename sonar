@@ -14,6 +14,7 @@ Usage: ./sonar COMMAND
   up                         Start and initialize SonarQube
   scan NAME [--check-gate]    Scan projects/NAME
   scan --all [--check-gate]   Scan every repository sequentially
+  report NAME                Export HTML summary and CSV findings
   status                     Show service and server status
   logs [sonarqube|postgres]   Show the latest 100 service log lines
   credentials                Display the local web login
@@ -22,7 +23,8 @@ Usage: ./sonar COMMAND
   help                       Show this help
 
 Environment: SONAR_PORT (9000), SONAR_STARTUP_TIMEOUT (300 seconds),
-SONAR_ANALYSIS_TIMEOUT (300 seconds), SONAR_SCAN_TIMEOUT (1800 seconds).
+SONAR_ANALYSIS_TIMEOUT (300 seconds), SONAR_SCAN_TIMEOUT (1800 seconds),
+SONAR_REPORT_TIMEOUT (600 seconds).
 EOF
 }
 
@@ -36,6 +38,9 @@ case "$COMMAND" in
         ;;
     scan)
         [ "$#" -ge 2 ] || fail "Use ./sonar scan NAME or ./sonar scan --all."
+        ;;
+    report)
+        [ "$#" -eq 2 ] || fail "Use ./sonar report NAME."
         ;;
     logs)
         [ "$#" -le 2 ] || fail "Use ./sonar logs [sonarqube|postgres]."
@@ -147,6 +152,11 @@ case "$COMMAND" in
         [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run ./sonar up first."
         build_tools
         tools credentials
+        ;;
+    report)
+        [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run ./sonar scan NAME first."
+        build_tools
+        tools report "$2"
         ;;
     status)
         compose ps -a

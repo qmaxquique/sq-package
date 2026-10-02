@@ -132,6 +132,15 @@ def main():
         preserved = client().request("api/project_analyses/search", {"project": "local:alpha"})["analyses"]
         assert {item["key"] for item in history} == {item["key"] for item in preserved}
         cli("status")
+        before_report = credentials()
+        cli("report", "alpha")
+        report_files = list((workspace / ".state" / "reports" / "alpha").glob("*/index.html"))
+        assert len(report_files) == 1
+        assert "FAILED" in report_files[0].read_text()
+        assert (report_files[0].parent / "issues.csv").is_file()
+        assert (report_files[0].parent / "security-hotspots.csv").is_file()
+        assert credentials() == before_report, "Report changed credentials"
+        cli("report", "missing", expected=1)
         cli("scan", "missing", expected=1)
         assert snapshot(workspace / "projects") == originals, "A source or Git file changed"
         assert snapshot(workspace / "config") == config_originals, "Project configuration changed"
@@ -143,7 +152,7 @@ def main():
         passed = True
         print("Smoke passed on " + platform.system() + "/" + platform.machine() + ": "
               "3 projects, coverage/tests import, gate modes, token recovery, restart persistence, "
-              "unchanged sources/Git, and reset preservation.", flush=True)
+              "HTML/CSV export, unchanged sources/Git, and reset preservation.", flush=True)
         return 0
     finally:
         cleaned = passed

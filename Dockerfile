@@ -22,6 +22,7 @@ ENV PATH="/opt/sonar-scanner/bin:${PATH}" \
     SONAR_USER_HOME=/state/cache
 
 COPY scripts/sonar.py /opt/sonar-package/sonar.py
+COPY scripts/report.py /opt/sonar-package/report.py
 USER 1000:1000
 WORKDIR /tmp
 ENTRYPOINT ["python3", "/opt/sonar-package/sonar.py"]

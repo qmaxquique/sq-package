@@ -77,6 +77,7 @@ Scans use the current local checkout, including uncommitted edits. The package p
 | `./sonar scan --all` | Analyze every repository sequentially. |
 | `./sonar scan my-app --check-gate` | Analyze, then fail the command if the gate does not pass. |
 | `./sonar scan --all --check-gate` | Apply gate enforcement to every repository. |
+| `./sonar report my-app` | Export the latest completed analysis as an HTML summary and CSV findings. |
 | `./sonar status` | Show Compose services and server readiness. |
 | `./sonar logs` | Show the latest 100 service log lines. |
 | `./sonar logs sonarqube` | Show only SonarQube logs. `postgres` also works. |
@@ -88,6 +89,20 @@ Scans use the current local checkout, including uncommitted edits. The package p
 Exit statuses: `0` means completed successfully; `1` means a configuration, scanner, or server error; `2` means a completed analysis failed gate enforcement. A failed gate still publishes results. Without `--check-gate`, gate failure is informational. For `--all`, runtime errors in one project do not prevent the remaining projects from scanning; any runtime error takes precedence over gate failures.
 
 Operations are serialized. If another command is running, finish it before starting a new one. Stale locks with a dead owner are recovered automatically.
+
+### Downloadable reports
+
+```bash
+./sonar report my-app
+```
+
+The command prints the path to `.state/reports/my-app/<export-id>/index.html`. Open this file in your browser to view or print it to PDF. The folder also contains `issues.csv` with all issues and `security-hotspots.csv` with all security hotspots. Keep the three files together when sharing the report; the HTML links to the CSV files. Exports are self-contained and use no external scripts, fonts, or styles. Links back to the dashboard and individual findings require the running local server and login.
+
+The HTML includes analysis date/ID, quality gate conditions, code metrics, severity counts, and the first 100 issues ordered by severity. CSV files include rule, file, line, status, message, and review information. Security hotspots are listed separately because they require review rather than necessarily representing confirmed vulnerabilities. Spreadsheet formulas in CSV cells are escaped.
+
+Reports read current server findings for the latest completed analysis, including resolved issues returned by the API and current review states. They do not scan repositories, run tests, create projects, or rotate tokens. SonarQube must already be running; use `./sonar up` if it is stopped. A local repository/configuration is not required to export an existing project. Large result sets are fetched by component to work around the API's 10,000-result search limit. Incomplete exports, changing counts, or an analysis completing during export cause an error instead of a silently truncated report. Avoid changing issue states while exporting; the API does not provide a transactional snapshot.
+
+Exports use the existing local admin credentials without including them or source contents in the report. Findings can still contain sensitive file paths and messages, so review them before sharing. Files are ignored by Git and have restricted permissions. `./sonar reset --yes` deletes exports along with other package state; copy any reports you want to keep elsewhere first. Built-in PDF reports are an Enterprise Edition feature; this package generates its own HTML/CSV report using the Community Build Web API.
 
 ### Port and timeouts
 
@@ -102,6 +117,7 @@ SONAR_STARTUP_TIMEOUT=600 SONAR_ANALYSIS_TIMEOUT=600 ./sonar scan --all
 | `SONAR_STARTUP_TIMEOUT` | `300` | Seconds to wait for server readiness. |
 | `SONAR_ANALYSIS_TIMEOUT` | `300` | Seconds to wait for each uploaded analysis and gate computation. |
 | `SONAR_SCAN_TIMEOUT` | `1800` | Seconds allowed for each scanner process. |
+| `SONAR_REPORT_TIMEOUT` | `600` | Seconds allowed for the complete report export. |
 
 Use the `./sonar` wrapper for normal operation. It selects an installation-specific Compose project and loads generated database credentials. Plain `docker compose up` uses a different project name and does not initialize those credentials.
 

@@ -2,3 +2,4 @@
 !Dockerfile
 !scripts/
 !scripts/sonar.py
+!scripts/report.py

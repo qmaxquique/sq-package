@@ -650,6 +650,29 @@ class SonarPackage:
         print("Username: admin")
         print("Password: " + data["admin_password"])
 
+    def report(self, name):
+        from report import Exporter, ExportError, finding_csv, render_html
+        # Export existing server data without scanning, changing tokens, or bootstrapping.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name):
+            raise PackageError("Invalid project folder name.")
+        data = self.state.require()
+        if not data["admin_initialized"]:
+            raise PackageError("Initial setup has not completed. Run ./sonar up first.")
+        try:
+            report = Exporter(self.client(), "local:" + name, self.web_url,
+                              positive_timeout("SONAR_REPORT_TIMEOUT", "600")).collect()
+            # Publish only after all API requests and completeness checks succeeded.
+            directory = self.state.directory / "reports" / name / uuid.uuid4().hex
+            directory.mkdir(parents=True, mode=0o700)
+            for filename, content in (("index.html", render_html(report)),
+                                      ("issues.csv", finding_csv(report)),
+                                      ("security-hotspots.csv", finding_csv(report, hotspot=True))):
+                atomic_write(directory / filename, self.state.redact(content))
+            print("Report: .state/" + str(directory.relative_to(self.state.directory)) + "/index.html")
+            print("CSV files: issues.csv and security-hotspots.csv in the same folder.")
+        except ExportError as error:
+            raise PackageError(str(error)) from error
+
     def status(self):
         try:
             status = SonarClient(self.api_url).request("api/system/status").get("status", "UNKNOWN")
@@ -677,6 +700,7 @@ def main(argv=None):
             command.add_argument("name", nargs="?")
             command.add_argument("--all", action="store_true", dest="all_projects")
             command.add_argument("--check-gate", action="store_true")
+        commands.add_parser("report").add_argument("name")
         arguments = parser.parse_args(argv)
         package = SonarPackage()
         if arguments.command == "init":
@@ -689,6 +713,8 @@ def main(argv=None):
             package.credentials()
         elif arguments.command == "status":
             return package.status()
+        elif arguments.command == "report":
+            package.report(arguments.name)
         else:
             names = package.names(arguments.name, arguments.all_projects)
             package.validate(names)
