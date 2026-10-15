@@ -12,6 +12,10 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -20,11 +24,21 @@ jobs:
         run: |
           bash -n sonar
           docker compose --profile tools config --quiet
+          docker compose -f compose.yaml -f compose.podman.yaml --profile tools config --quiet
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Configure Elasticsearch prerequisites on the test runner
         run: |
           sudo sysctl -w vm.max_map_count=524288
           sudo sysctl -w fs.file-max=131072
-      - name: Run native Linux AMD64 smoke suite
+      - name: Install Podman and Compose provider
+        if: matrix.engine == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman podman-compose
+      - name: Run native Linux AMD64 Docker smoke suite
+        if: matrix.engine == 'docker'
         run: python3 tests/smoke.py
+      - name: Run native Linux AMD64 Podman smoke suite
+        if: matrix.engine == 'podman'
+        run: sudo env PODMAN_COMPOSE_PROVIDER=/usr/bin/podman-compose python3 tests/smoke.py --engine podman

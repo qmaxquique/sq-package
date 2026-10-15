@@ -155,6 +155,83 @@ class ConfigurationTests(PackageFixture):
         self.assertEqual(self.package.names("app"), ["app"])
         self.assertEqual(self.package.properties("app")["sonar.sources"], ".")
 
+    def test_python_only_repository_requires_no_configuration(self):
+        (self.repository / "index.php").unlink()
+        (self.repository / "app.py").write_text("print('hello')\n")
+        properties = self.package.properties("app")
+        self.assertIn("**/*.py", properties["sonar.inclusions"])
+        self.assertNotIn("sonar.python.coverage.reportPaths", properties)
+        self.assertNotIn("sonar.python.xunit.reportPath", properties)
+
+    def test_mixed_repository_defaults_and_explicit_language_selection(self):
+        (self.repository / "app.py").write_text("print('hello')\n")
+        properties = self.package.properties("app")
+        for pattern in ("**/*.py", "**/*.php"):
+            self.assertIn(pattern, properties["sonar.inclusions"])
+        self.override("sonar.inclusions=**/*.py\nsonar.python.version=3.11,3.12\n")
+        self.assertEqual(self.package.properties("app")["sonar.python.version"], "3.11,3.12")
+        (self.repository / "app.py").unlink()
+        with self.assertRaisesRegex(sonar.PackageError, "No PHP or Python"):
+            self.package.properties("app")
+
+    def test_python_environments_and_caches_do_not_count_as_sources(self):
+        (self.repository / "index.php").unlink()
+        for folder in (".venv", "venv", "nested/site-packages", "__pycache__",
+                       ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", "app.egg-info"):
+            path = self.repository / folder / "dependency.py"
+            path.parent.mkdir(parents=True)
+            path.write_text("print('dependency')\n")
+        with self.assertRaisesRegex(sonar.PackageError, "No PHP or Python"):
+            self.package.properties("app")
+        (self.repository / "app.py").write_text("print('owned')\n")
+        properties = self.package.properties("app")
+        for key in ("sonar.exclusions", "sonar.test.exclusions"):
+            self.assertTrue(all(any(sonar.matches(path.relative_to(self.repository).as_posix(), p)
+                                    for p in sonar.comma_values(properties[key]))
+                                for path in self.repository.rglob("dependency.py")))
+
+    def test_python_tests_are_separated_from_production_sources(self):
+        (self.repository / "tests").mkdir()
+        (self.repository / "tests" / "test_app.py").write_text("def test_app():\n    assert True\n")
+        self.override("sonar.tests=tests\n")
+        self.assertIn("tests/**", self.package.properties("app")["sonar.exclusions"])
+        (self.repository / "index.php").unlink()
+        with self.assertRaisesRegex(sonar.PackageError, "No PHP or Python"):
+            self.package.properties("app")
+
+    def test_custom_python_suffixes_still_respect_inclusions(self):
+        (self.repository / "index.php").unlink()
+        (self.repository / "app.pyw").write_text("print('hello')\n")
+        self.override("sonar.python.file.suffixes=.py,.pyw\n")
+        with self.assertRaises(sonar.PackageError):
+            self.package.properties("app")
+        self.override("sonar.python.file.suffixes=.py,.pyw\nsonar.inclusions=**/*.pyw\n")
+        self.assertEqual(self.package.properties("app")["sonar.python.file.suffixes"], ".py,.pyw")
+
+    def test_python_reports_are_optional_and_validated(self):
+        for filename in ("coverage.xml", "coverage-other.xml", "junit.xml"):
+            (self.repository / filename).write_text("<report/>\n")
+        self.override("sonar.python.coverage.reportPaths=coverage.xml,coverage-other.xml\n"
+                      "sonar.python.xunit.reportPath=junit.xml\n")
+        properties = self.package.properties("app")
+        self.assertEqual(properties["sonar.python.coverage.reportPaths"], "coverage.xml,coverage-other.xml")
+        self.assertEqual(properties["sonar.python.xunit.reportPath"], "junit.xml")
+        for key in ("sonar.python.coverage.reportPaths", "sonar.python.xunit.reportPath"):
+            for value in ("", "missing.xml", "../outside.xml", "/tmp/report.xml", ".", "*.xml"):
+                with self.subTest(key=key, value=value):
+                    self.override(key + "=" + value + "\n")
+                    with self.assertRaises(sonar.PackageError):
+                        self.package.properties("app")
+        self.override("sonar.python.xunit.reportPath=junit.xml,coverage.xml\n")
+        with self.assertRaisesRegex(sonar.PackageError, "Invalid report path"):
+            self.package.properties("app")
+
+    def test_python_example_is_usable_without_optional_paths(self):
+        (self.repository / "index.php").unlink()
+        (self.repository / "app.py").write_text("print('hello')\n")
+        self.override((ROOT / "config/examples/python.properties").read_text())
+        self.assertEqual(self.package.properties("app")["sonar.sources"], ".")
+
     def test_missing_repository_or_ambiguous_arguments(self):
         for name, all_projects in (("missing", False), (None, False), ("app", True), ("../app", False)):
             with self.subTest(name=name, all_projects=all_projects), self.assertRaises(sonar.PackageError):
@@ -309,6 +386,14 @@ class BootstrapTests(PackageFixture):
         self.assertEqual(self.api.password_changes, 1)
         self.assertEqual(self.api.password, "Aa1! with &=+ spaces")
 
+    def test_podman_setup_prints_matching_credentials_command(self):
+        with patch.dict(os.environ, {"SONAR_ENGINE": "podman"}):
+            package = sonar.SonarPackage(self.state, self.projects, self.config, self.api.url)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            package.bootstrap()
+        self.assertIn("./sonar --engine podman credentials", output.getvalue())
+
     def test_interrupted_password_setup_resumes_without_rotating_again(self):
         with patch.object(self.package.state, "save", side_effect=OSError("interrupted")):
             with self.assertRaises(OSError):
@@ -431,10 +516,33 @@ if [ "$1" = context ]; then printf '%s\\n' "${FAKE_DOCKER_ENDPOINT:-unix:///fake
 exit 0
 """)
         docker.chmod(0o755)
+        podman = self.binary / "podman"
+        podman.write_text("""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$PODMAN_CALLS"
+if [ "$1" = info ]; then
+    if [ "${2:-}" = --format ]; then
+        case "${3:-}" in
+            *ServiceIsRemote*) printf '%s\\n' "${FAKE_PODMAN_REMOTE:-true}" ;;
+            *) printf '%s\\n' "${FAKE_PODMAN_ROOTLESS:-true}" ;;
+        esac
+    fi
+    exit "${FAKE_PODMAN_DOWN:-0}"
+fi
+if [ "$1" = system ]; then printf '%b' "${FAKE_PODMAN_CONNECTIONS:-}"; fi
+if [ "$1" = compose ] && [ "${2:-}" = version ]; then exit "${FAKE_PODMAN_COMPOSE_DOWN:-0}"; fi
+if [ "$1" = compose ]; then
+    printf 'userns=%s docker_host=%s docker_context=%s\\n' "${SONAR_PODMAN_USERNS:-}" "${DOCKER_HOST:-unset}" "${DOCKER_CONTEXT:-unset}" >> "$PODMAN_CALLS"
+fi
+exit 0
+""")
+        podman.chmod(0o755)
         self.calls = self.root / "docker-calls"
+        self.podman_calls = self.root / "podman-calls"
         self.environment = dict(os.environ, PATH=str(self.binary) + os.pathsep + os.environ["PATH"],
-                                DOCKER_CALLS=str(self.calls))
-        self.environment.pop("DOCKER_HOST", None)
+                                DOCKER_CALLS=str(self.calls), PODMAN_CALLS=str(self.podman_calls))
+        for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "SONAR_ENGINE", "SONAR_STATE_PATH",
+                     "CONTAINER_HOST", "CONTAINER_CONNECTION"):
+            self.environment.pop(name, None)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -512,6 +620,120 @@ exit 0
         result = self.cli("up")
         self.assertEqual(result.returncode, 1)
         self.assertIn("between 1 and 65535", result.stderr)
+
+    def test_default_engine_keeps_docker_state_layout(self):
+        self.assertEqual(self.cli("down").returncode, 0)
+        self.assertTrue((self.root / ".state" / "stack-name").is_file())
+        self.assertFalse(self.podman_calls.exists())
+        self.assertNotIn("compose.podman.yaml", self.calls.read_text())
+
+    def test_explicit_podman_never_contacts_docker(self):
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        state = self.root / ".state" / "podman"
+        self.assertTrue((state / "stack-name").read_text().strip().endswith("-podman"))
+        calls = self.podman_calls.read_text()
+        self.assertIn("compose.podman.yaml", calls)
+        self.assertIn(str(state / "runtime.env"), calls)
+
+    def test_podman_can_be_selected_via_environment_and_overridden(self):
+        self.environment["SONAR_ENGINE"] = "podman"
+        self.assertEqual(self.cli("down").returncode, 0)
+        self.assertEqual(self.cli("--engine=docker", "down").returncode, 0)
+        self.assertTrue(self.calls.exists())
+        self.assertTrue(self.podman_calls.exists())
+
+    def test_invalid_engine_fails_before_any_runtime_calls(self):
+        for arguments in (("--engine",), ("--engine", "other", "up"), ("--engine=", "up")):
+            result = self.cli(*arguments)
+            self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse(self.podman_calls.exists())
+
+    def test_stopped_podman_has_actionable_error(self):
+        self.environment["FAKE_PODMAN_DOWN"] = "1"
+        result = self.cli("--engine", "podman", "up")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Podman is not running", result.stderr)
+
+    def test_podman_requires_compose_provider(self):
+        self.environment["FAKE_PODMAN_COMPOSE_DOWN"] = "1"
+        result = self.cli("--engine", "podman", "up")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PODMAN_COMPOSE_PROVIDER", result.stderr)
+
+    def test_podman_rejects_remote_connections(self):
+        for value in ("ssh://user@remote.example/run/podman.sock", "tcp://remote.example:8080"):
+            self.environment["CONTAINER_HOST"] = value
+            result = self.cli("--engine", "podman", "up")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("remote Podman hosts are unsupported", result.stderr)
+
+    def test_podman_accepts_local_machine_connection(self):
+        self.environment["FAKE_PODMAN_CONNECTIONS"] = "machine\\tssh://core@127.0.0.1:1234/run/user/501/podman.sock\\ttrue\\ttrue\\n"
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_podman_accepts_explicit_known_machine_endpoint(self):
+        self.environment["CONTAINER_HOST"] = "ssh://core@127.0.0.1:1234/run/podman.sock"
+        self.environment["FAKE_PODMAN_CONNECTIONS"] = "machine\\tssh://core@127.0.0.1:1234/run/podman.sock\\ttrue\\ttrue\\n"
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_podman_user_namespace_and_docker_context_isolation(self):
+        self.environment.update(DOCKER_HOST="unix:///docker.sock", DOCKER_CONTEXT="docker-desktop")
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("userns=keep-id:uid={},gid={} docker_host=unset docker_context=unset".format(
+            os.getuid(), os.getgid()), self.podman_calls.read_text())
+        self.environment["FAKE_PODMAN_ROOTLESS"] = "false"
+        self.assertEqual(self.cli("--engine", "podman", "down").returncode, 0)
+        self.assertIn("userns=host", self.podman_calls.read_text())
+
+    def test_podman_builds_directly_and_forwards_scan_flags(self):
+        result = self.cli("--engine", "podman", "scan", "app", "--check-gate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.podman_calls.read_text()
+        self.assertIn("build --format docker --quiet --tag localhost/", calls)
+        self.assertIn("run --rm --no-deps -T tools scan app --check-gate", calls)
+        self.assertFalse(self.calls.exists())
+
+    def test_podman_selected_connection_cannot_bypass_remote_check(self):
+        self.environment["CONTAINER_CONNECTION"] = "remote"
+        self.environment["FAKE_PODMAN_CONNECTIONS"] = "local\\tunix:///local.sock\\ttrue\\tfalse\\nremote\\tssh://user@remote.example/run/podman.sock\\tfalse\\tfalse\\n"
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("remote Podman hosts are unsupported", result.stderr)
+
+    def test_native_linux_podman_ignores_unused_remote_connection(self):
+        self.environment["FAKE_PODMAN_REMOTE"] = "false"
+        self.environment["FAKE_PODMAN_CONNECTIONS"] = "saved\\tssh://user@remote.example/run/podman.sock\\ttrue\\tfalse\\n"
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("system connection list", self.podman_calls.read_text())
+
+    def test_reset_only_deletes_selected_engine_state(self):
+        docker_state = self.root / ".state"
+        podman_state = docker_state / "podman"
+        podman_state.mkdir(parents=True)
+        (docker_state / "credentials.json").write_text("Docker private state")
+        (podman_state / "credentials.json").write_text("Podman private state")
+        self.assertEqual(self.cli("reset", "--yes").returncode, 0)
+        self.assertEqual((podman_state / "credentials.json").read_text(), "Podman private state")
+        self.assertFalse((docker_state / "credentials.json").exists())
+        (docker_state / "credentials.json").write_text("Docker private state")
+        self.assertEqual(self.cli("--engine", "podman", "reset", "--yes").returncode, 0)
+        self.assertFalse(podman_state.exists())
+        self.assertEqual((docker_state / "credentials.json").read_text(), "Docker private state")
+
+    def test_podman_uses_shared_package_lock(self):
+        lock = self.root / ".state" / "lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(os.getpid()))
+        result = self.cli("--engine", "podman", "down")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Another package operation", result.stderr)
 
 
 class InvalidStateTests(PackageFixture):

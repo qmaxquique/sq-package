@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    image: docker.io/library/postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
     environment:
       POSTGRES_USER: sonar
       POSTGRES_DB: sonar
@@ -15,7 +15,7 @@ services:
     restart: unless-stopped
 
   sonarqube:
-    image: sonarqube:26.9.0.129388-community@sha256:4905574ab8584dcac1a06c01cdc43a4ce9e369723ac4a7ab1d029c1bf71e6fe9
+    image: docker.io/library/sonarqube:26.9.0.129388-community@sha256:4905574ab8584dcac1a06c01cdc43a4ce9e369723ac4a7ab1d029c1bf71e6fe9
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,6 +40,7 @@ services:
 
   tools:
     profiles: ["tools"]
+    image: ${SONAR_TOOLS_IMAGE:-sonar-package-tools}
     build:
       context: .
       dockerfile: Dockerfile
@@ -53,8 +54,9 @@ services:
       SONAR_STATE_DIR: /state
       SONAR_PROJECTS_DIR: /projects
       SONAR_CONFIG_DIR: /config
+      SONAR_ENGINE: ${SONAR_ENGINE:-docker}
     volumes:
-      - ./.state:/state
+      - ${SONAR_STATE_PATH:-./.state}:/state
       - ./projects:/projects:ro
       - ./config:/config:ro
     init: true

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Run a real, isolated Docker smoke test; clean up its own volumes afterward."""
+"""Run a real, isolated Docker/Podman smoke test; clean up its own volumes afterward."""
 from __future__ import annotations
 
 import hashlib
+import csv
+import argparse
 import json
 import os
 from pathlib import Path
@@ -24,9 +26,12 @@ def snapshot(directory):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine", choices=("docker", "podman"), default="docker")
+    engine = parser.parse_args().engine
     # A path containing spaces also exercises the Bash wrapper's quoting.
     workspace = Path(tempfile.mkdtemp(prefix="sonar smoke "))
-    for name in ("sonar", "compose.yaml", "Dockerfile", ".dockerignore"):
+    for name in ("sonar", "compose.yaml", "compose.podman.yaml", "Dockerfile", ".dockerignore"):
         shutil.copy2(str(ROOT / name), str(workspace / name))
     shutil.copytree(str(ROOT / "scripts"), str(workspace / "scripts"), ignore=shutil.ignore_patterns("__pycache__"))
     (workspace / "config" / "projects").mkdir(parents=True)
@@ -35,7 +40,18 @@ def main():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    environment = dict(os.environ, SONAR_PORT=str(port), GIT_OPTIONAL_LOCKS="0")
+    environment = dict(os.environ, SONAR_PORT=str(port), GIT_OPTIONAL_LOCKS="0", SONAR_ENGINE=engine)
+    if engine == "podman":
+        # The fixtures pull public images. Do not invoke personal registry helpers.
+        auth = workspace / "registry-auth.json"
+        auth.write_text('{"auths": {}}\n')
+        docker_config = workspace / "docker-config"
+        docker_config.mkdir()
+        (docker_config / "config.json").write_text('{"auths": {}}\n')
+        environment.update(REGISTRY_AUTH_FILE=str(auth), DOCKER_CONFIG=str(docker_config))
+    state = workspace / ".state"
+    if engine == "podman":
+        state = state / "podman"
     web_url = "http://localhost:" + str(port)
     (workspace / "config" / "projects" / "alpha.properties").write_text(
         "sonar.sources=src\nsonar.tests=tests\n"
@@ -45,6 +61,17 @@ def main():
     (workspace / "config" / "projects" / "wordpress.properties").write_text(
         "sonar.sources=wp-content/themes/owned,wp-content/plugins/owned\n"
     )
+    (workspace / "config" / "projects" / "python.properties").write_text(
+        "sonar.sources=src\nsonar.tests=tests\nsonar.python.version=3.12\n"
+        "sonar.python.coverage.reportPaths=coverage/coverage.xml\n"
+        "sonar.python.xunit.reportPath=coverage/junit.xml\n"
+    )
+    # Git-track these deliberately so SCM ignores cannot hide a missing exclusion.
+    for folder in (".venv", "venv", "site-packages", "__pycache__", ".pytest_cache",
+                   ".mypy_cache", ".ruff_cache", ".tox", ".nox", "example.egg-info"):
+        path = workspace / "projects" / "mixed" / folder / "dependency.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("print('dependency')\n")
     for repository in (workspace / "projects").iterdir():
         subprocess.run(["git", "init", "--quiet", str(repository)], check=True, env=environment)
         subprocess.run(["git", "-C", str(repository), "add", "."], check=True, env=environment)
@@ -70,7 +97,7 @@ def main():
         return result.stdout
 
     def credentials():
-        return json.loads((workspace / ".state" / "credentials.json").read_text())
+        return json.loads((state / "credentials.json").read_text())
 
     def client():
         return SonarClient(web_url, password=credentials()["admin_password"])
@@ -91,16 +118,25 @@ def main():
         assert initial["admin_initialized"] is True
         assert not SonarClient(web_url, password="admin").authenticated(), "Initial administrator password still works"
         components = client().request("api/projects/search", {"ps": 100})["components"]
-        assert {item["key"] for item in components} == {"local:alpha", "local:beta", "local:wordpress"}
+        assert {item["key"] for item in components} == {
+            "local:alpha", "local:beta", "local:wordpress", "local:python", "local:mixed",
+        }
         assert all(item["visibility"] == "private" for item in components)
         assert files("local:alpha") == {"src/Calculator.php"}
         assert files("local:beta") == {"index.php"}
+        assert files("local:python") == {"src/app.py"}
+        assert files("local:mixed") == {"index.php", "worker.py"}
         assert files("local:wordpress") == {
             "wp-content/themes/owned/functions.php", "wp-content/plugins/owned/plugin.php",
         }
         alpha_metrics = measures("local:alpha", "coverage,tests")
         assert 0 < float(alpha_metrics["coverage"]) < 100, alpha_metrics
         assert int(alpha_metrics["tests"]) == 1, alpha_metrics
+        python_metrics = measures("local:python", "coverage,tests,test_errors,test_failures")
+        assert 0 < float(python_metrics["coverage"]) < 100, python_metrics
+        assert int(python_metrics["tests"]) == 1, python_metrics
+        assert int(python_metrics["test_errors"]) == 0, python_metrics
+        assert int(python_metrics["test_failures"]) == 0, python_metrics
         cli("up")
         assert credentials() == initial, "Repeated setup changed stored credentials"
         cli("scan", "beta")
@@ -134,11 +170,18 @@ def main():
         cli("status")
         before_report = credentials()
         cli("report", "alpha")
-        report_files = list((workspace / ".state" / "reports" / "alpha").glob("*/index.html"))
+        report_files = list((state / "reports" / "alpha").glob("*/index.html"))
         assert len(report_files) == 1
         assert "FAILED" in report_files[0].read_text()
         assert (report_files[0].parent / "issues.csv").is_file()
         assert (report_files[0].parent / "security-hotspots.csv").is_file()
+        cli("report", "python")
+        python_reports = list((state / "reports" / "python").glob("*/index.html"))
+        assert len(python_reports) == 1
+        with (python_reports[0].parent / "issues.csv").open(newline="") as stream:
+            python_findings = list(csv.DictReader(stream))
+        assert any(row["rule"].startswith("python:") and row["file"] == "src/app.py"
+                   for row in python_findings), "Python findings missing from CSV export"
         assert credentials() == before_report, "Report changed credentials"
         cli("report", "missing", expected=1)
         cli("scan", "missing", expected=1)
@@ -150,8 +193,9 @@ def main():
         assert snapshot(workspace / "projects") == originals, "Reset removed source files"
         assert snapshot(workspace / "config") == config_originals, "Reset removed configuration"
         passed = True
-        print("Smoke passed on " + platform.system() + "/" + platform.machine() + ": "
-              "3 projects, coverage/tests import, gate modes, token recovery, restart persistence, "
+        print("Smoke passed with " + engine + " on " + platform.system() + "/" + platform.machine() + ": "
+              "5 PHP/Python/mixed projects, coverage/tests import, dependency exclusions, "
+              "gate modes, token recovery, restart persistence, "
               "HTML/CSV export, unchanged sources/Git, and reset preservation.", flush=True)
         return 0
     finally:

@@ -1,12 +1,12 @@
-FROM eclipse-temurin:21-jre-noble@sha256:0c324fbe2e1455c3159184717440f3b52906ef82a39c4a6efc9edb401d31971a
+FROM docker.io/library/eclipse-temurin:21-jre-noble@sha256:0c324fbe2e1455c3159184717440f3b52906ef82a39c4a6efc9edb401d31971a
 
 # This distribution uses the native Java runtime from the multi-architecture base.
 # SHA256 of SonarSource's sonar-scanner-cli-8.1.0.6389.zip.
-ADD --checksum=sha256:ab76ab3c360025e9108be5b55be066f304a164f8b2850d2f2f333915db51bc1b \
-    https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389.zip /tmp/scanner.zip
-
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git python3 unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl git python3 unzip \
+    && curl --fail --location --retry 3 --output /tmp/scanner.zip \
+        https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389.zip \
+    && printf '%s\n' 'ab76ab3c360025e9108be5b55be066f304a164f8b2850d2f2f333915db51bc1b  /tmp/scanner.zip' | sha256sum --check - \
     && unzip -q /tmp/scanner.zip -d /opt \
     && mv /opt/sonar-scanner-8.1.0.6389 /opt/sonar-scanner \
     && chmod -R a+rX /opt/sonar-scanner \

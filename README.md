@@ -1,24 +1,24 @@
-# Local PHP SonarQube package
+# Local PHP and Python SonarQube package
 
-Clone PHP repositories into `projects/`, run a scan, and open the printed SonarQube dashboard. Each repository has its own private project and analysis history.
+Clone PHP, Python, or mixed repositories into `projects/`, run a scan, and open the printed SonarQube dashboard. Each repository has its own private project and analysis history.
 
-The package runs SonarQube Community Build, PostgreSQL, and a native one-shot scanner with Docker Compose. Setup, administrator password rotation, project registration, and scan tokens are automated.
+The package runs SonarQube Community Build, PostgreSQL, and a native one-shot scanner with Docker Compose or Podman Compose. Docker is the default; select Podman explicitly with `--engine podman` or `SONAR_ENGINE=podman`. Setup, administrator password rotation, project registration, and scan tokens are automated.
 
 ## Requirements
 
-- macOS or Linux, on Intel/AMD64 or ARM64, with a **local** Docker daemon.
-- Bash, Git, current Docker with BuildKit-enabled builds, and the Docker Compose v2-or-newer plugin.
-- Docker Desktop running on macOS, or Docker Engine running on Linux.
-- Recommended: allocate **8 GB RAM**, at least **2 CPUs**, and **30 GB available disk** to Docker. Keep at least 10% of its disk free. Requirements grow with repository size.
-- Network access for Docker images, the verified scanner download, and Ubuntu packages during the first tools build.
+- macOS or Linux, on Intel/AMD64 or ARM64, with a **local** container engine.
+- Bash and Git, plus either Docker with the Docker Compose v2-or-newer plugin, or Podman with `podman compose` and an external Compose provider.
+- Docker Desktop / Podman machine running on macOS, or Docker Engine / Podman running on Linux.
+- Recommended: allocate **8 GB RAM**, at least **2 CPUs**, and **30 GB available disk** to the selected engine. Keep at least 10% of its disk free. Requirements grow with repository size.
+- Network access for container images, the verified scanner download, and Ubuntu packages during the first tools build.
 
-Using this package requires no host PHP, Composer, PHPUnit, Java, or Python installation. The tools container includes Java and Python; your existing test environment remains responsible for PHPUnit. Python 3.8+ is only needed if you run the maintainer tests locally.
+Using this package requires no host PHP, Composer, PHPUnit, Java, or Python installation. The tools container includes Java and Python; your existing test environment remains responsible for PHPUnit, pytest, and coverage generation. Python 3.8+ is only needed if you run the maintainer tests locally.
 
-### Linux and Docker VM prerequisites
+### Linux and container VM prerequisites
 
 SonarQube's embedded Elasticsearch requires `vm.max_map_count >= 524288`, `fs.file-max >= 131072`, and suitable process/file limits. Compose supplies `nofile=131072` and `nproc=8192` for the server container. Startup checks the kernel values before starting services. The package does not change kernel settings or disable Elasticsearch bootstrap checks.
 
-Check the Linux Docker host:
+Check the Linux container host:
 
 ```bash
 sysctl vm.max_map_count fs.file-max
@@ -49,6 +49,55 @@ docker run --rm --privileged --user 0:0 --entrypoint python3 "$SONAR_TOOLS_IMAGE
 ```
 
 Docker Desktop may reset this setting after restarting its VM, including an idle VM restart through Resource Saver. Record the original value before changing it. See the [SonarQube host requirements](https://docs.sonarsource.com/sonarqube-community-build/server-installation/server-host-requirements) and [Linux prerequisites](https://docs.sonarsource.com/sonarqube-community-build/server-installation/pre-installation/linux).
+
+For a macOS Podman machine, inspect and set the values **inside that VM** (replace the name if using a custom machine):
+
+```bash
+podman machine ssh podman-machine-default sysctl vm.max_map_count fs.file-max
+podman machine ssh podman-machine-default sudo sysctl -w vm.max_map_count=524288
+```
+
+Set `fs.file-max=131072` inside the VM only if its existing value is lower. For persistence, use the same `/etc/sysctl.d/99-sonarqube.conf` approach inside the VM. A rootless privileged container cannot change the VM's host kernel settings. The package only checks prerequisites; it does not alter them.
+
+### Selecting Podman
+
+```bash
+./sonar --engine podman scan my-app
+./sonar --engine podman report my-app
+./sonar --engine podman credentials
+./sonar --engine podman down
+```
+
+The global option precedes the command. `--engine=podman` also works. To select it for a shell session:
+
+```bash
+export SONAR_ENGINE=podman
+./sonar scan my-app
+```
+
+An explicit `--engine docker` overrides the environment. All commands, including logs, status, reset, and credentials, use the selected engine; there is no automatic fallback to another engine.
+
+Podman's `compose` command delegates to an installed provider, such as `docker-compose` or `podman-compose`. Use `podman compose version` to check it. `PODMAN_COMPOSE_PROVIDER` can select the provider executable, for example `PODMAN_COMPOSE_PROVIDER=podman-compose`. Installing the Docker Compose CLI as a provider does not require running Docker's daemon. [Podman Compose documentation](https://docs.podman.io/en/latest/markdown/podman-compose.1.html)
+
+On macOS, initialize a machine if needed, then start it:
+
+```bash
+podman machine init --cpus 2 --memory 8192 --disk-size 30
+podman machine start
+```
+
+Ensure the package folder is shared with that machine. Podman supports custom machines via `CONTAINER_CONNECTION`. Remote hosts are unsupported because source bind mounts and dashboard URLs refer to this computer. On Linux, a Docker Compose provider needs access to Podman's API socket; for rootless installations, `systemctl --user start podman.socket` makes that socket available. A `podman-compose` provider invokes Podman directly.
+
+Docker retains its existing `.state/` layout and named volumes. Podman uses `.state/podman/`, its own Compose project name, and its own volumes. Analysis history and credentials are separate; selecting another engine does not migrate them. Both engines share the read-only `projects/` and `config/` folders and the package operation lock. Reset affects only the selected engine's data, including its exported reports.
+
+Both stacks use port 9000 by default. To run them together, select another port for one stack and keep that port value for its later commands:
+
+```bash
+SONAR_PORT=9001 ./sonar --engine podman scan my-app
+SONAR_PORT=9001 ./sonar --engine podman report my-app
+```
+
+Rootless Podman maps the invoking user's ID into the tools container using `keep-id`, so restricted state files stay writable. The Podman tools override disables SELinux label separation only for that one-shot container, leaving cloned repositories' host labels and ownership unchanged; source/config mounts remain read-only. Server containers retain their normal security defaults. The package does not recursively chown or relabel repositories. [Podman user namespaces and mounts](https://docs.podman.io/en/latest/markdown/podman-run.1.html)
 
 ## Quick start
 
@@ -83,7 +132,7 @@ Scans use the current local checkout, including uncommitted edits. The package p
 | `./sonar logs sonarqube` | Show only SonarQube logs. `postgres` also works. |
 | `./sonar credentials` | Display the generated local UI username and password. |
 | `./sonar down` | Remove service containers while preserving data volumes and local state. |
-| `./sonar reset --yes` | Remove this installation's containers, volumes, and generated state; preserve repositories/configuration. |
+| `./sonar reset --yes` | Remove the selected engine's containers, volumes, and generated state; preserve repositories/configuration and the other engine's data. |
 | `./sonar help` | Show command help. |
 
 Exit statuses: `0` means completed successfully; `1` means a configuration, scanner, or server error; `2` means a completed analysis failed gate enforcement. A failed gate still publishes results. Without `--check-gate`, gate failure is informational. For `--all`, runtime errors in one project do not prevent the remaining projects from scanning; any runtime error takes precedence over gate failures.
@@ -96,7 +145,7 @@ Operations are serialized. If another command is running, finish it before start
 ./sonar report my-app
 ```
 
-The command prints the path to `.state/reports/my-app/<export-id>/index.html`. Open this file in your browser to view or print it to PDF. The folder also contains `issues.csv` with all issues and `security-hotspots.csv` with all security hotspots. Keep the three files together when sharing the report; the HTML links to the CSV files. Exports are self-contained and use no external scripts, fonts, or styles. Links back to the dashboard and individual findings require the running local server and login.
+The command prints the path to `.state/reports/my-app/<export-id>/index.html` for Docker, or `.state/podman/reports/my-app/<export-id>/index.html` for Podman. Open this file in your browser to view or print it to PDF. The folder also contains `issues.csv` with all issues and `security-hotspots.csv` with all security hotspots. Keep the three files together when sharing the report; the HTML links to the CSV files. Exports are self-contained and use no external scripts, fonts, or styles. Links back to the dashboard and individual findings require the running local server and login.
 
 The HTML includes analysis date/ID, quality gate conditions, code metrics, severity counts, and the first 100 issues ordered by severity. CSV files include rule, file, line, status, message, and review information. Security hotspots are listed separately because they require review rather than necessarily representing confirmed vulnerabilities. Spreadsheet formulas in CSV cells are escaped.
 
@@ -113,17 +162,18 @@ SONAR_STARTUP_TIMEOUT=600 SONAR_ANALYSIS_TIMEOUT=600 ./sonar scan --all
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `SONAR_ENGINE` | `docker` | Container engine (`docker` or `podman`); overridden by `--engine`. |
 | `SONAR_PORT` | `9000` | Local UI port. Use the same value for subsequent commands. |
 | `SONAR_STARTUP_TIMEOUT` | `300` | Seconds to wait for server readiness. |
 | `SONAR_ANALYSIS_TIMEOUT` | `300` | Seconds to wait for each uploaded analysis and gate computation. |
 | `SONAR_SCAN_TIMEOUT` | `1800` | Seconds allowed for each scanner process. |
 | `SONAR_REPORT_TIMEOUT` | `600` | Seconds allowed for the complete report export. |
 
-Use the `./sonar` wrapper for normal operation. It selects an installation-specific Compose project and loads generated database credentials. Plain `docker compose up` uses a different project name and does not initialize those credentials.
+Use the `./sonar` wrapper for normal operation. It selects an installation-specific Compose project and loads generated database credentials. Plain `docker compose up` or `podman compose up` uses a different project name and does not initialize those credentials.
 
 ## Repository configuration
 
-Generic defaults scan PHP files throughout the repository, including `.php`, `.php3`, `.php4`, `.php5`, `.phtml`, `.inc`, and `php.ini`. Dependencies and generated directories named `vendor`, `node_modules`, `.git`, `.scannerwork`, `coverage`, `build`, and `dist` are excluded. SonarQube's default PHP quality profile and quality gate remain in use.
+Generic defaults scan PHP files (`.php`, `.php3`, `.php4`, `.php5`, `.phtml`, `.inc`, and `php.ini`) and Python files (`.py`) throughout the repository. Both languages can be analyzed together with the same command. Dependencies and generated directories named `vendor`, `node_modules`, `.git`, `.scannerwork`, `coverage`, `build`, and `dist` are excluded. Python exclusions also cover `.venv`, `venv`, `site-packages`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, and `*.egg-info` directories. See [config/defaults.properties](config/defaults.properties) for the complete patterns. SonarQube's default quality profile for each detected language and default quality gate remain in use.
 
 For repository-specific settings, create `config/projects/<folder-name>.properties`:
 
@@ -143,9 +193,41 @@ Paths are relative to the repository root and must exist inside that repository.
 
 Overrides replace the matching default property. If you customize `sonar.exclusions`, retain any default exclusions your repository still needs. Configuration uses UTF-8 Java properties syntax, including escaped separators and continued lines.
 
+An existing `sonar.inclusions` override that selects only PHP will continue to do so. Remove that override or add `**/*.py` to include Python in that repository. To restrict a mixed repository to Python, use `sonar.inclusions=**/*.py`.
+
 The package reads its external configuration; an existing `sonar-project.properties` inside a clone is not loaded automatically. Project identity, server connection, credentials, working directory, branch/PR settings, and scanner connection settings are controlled by the package. Overrides that attempt to change them fail explicitly.
 
 Local per-repository overrides, clones, and generated state are Git-ignored. The reusable examples and package defaults are tracked.
+
+### Python
+
+Python applications use the same workflow, with no additional scanner image or dependency installation:
+
+```bash
+git clone <python-repository-url> projects/my-python-app
+./sonar scan my-python-app
+./sonar report my-python-app
+```
+
+Optional configuration:
+
+```bash
+cp config/examples/python.properties config/projects/my-python-app.properties
+```
+
+Enable paths and settings that match the application, for example:
+
+```properties
+sonar.sources=src
+sonar.tests=tests
+sonar.python.version=3.12
+sonar.python.coverage.reportPaths=coverage/coverage.xml
+sonar.python.xunit.reportPath=coverage/junit.xml
+```
+
+For a flat application, leave `sonar.sources=.` and configure `sonar.tests=tests` when the test directory exists. To separate colocated tests, set `sonar.tests=.`, `sonar.test.inclusions=**/test_*.py,**/*_test.py`. `sonar.python.version` can specify multiple supported versions, such as `3.11,3.12`; choose the versions your application actually targets. [SonarQube Python analysis](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/languages/python)
+
+The scanner does not install or execute the application, its dependencies, or its tests. Virtual environments with custom directory names (for example `env`) must be added to the exclusion list if they are inside the repository. The generated HTML and CSV reports support Python and mixed-language analyses through the existing report command.
 
 ### WordPress
 
@@ -163,7 +245,9 @@ This limits analysis to those directories, excluding WordPress core and third-pa
 
 ### Existing test and coverage reports
 
-SonarQube analyzes code and imports reports; this package does not install project dependencies or run PHPUnit. Generate reports in your existing test environment first, using repository-relative file references or paths matching the scanner's `/projects/<name>/` mount.
+SonarQube analyzes code and imports reports; this package does not install project dependencies or run PHPUnit or pytest. Generate reports in your existing test environment first, using repository-relative file references or paths matching the scanner's `/projects/<name>/` mount.
+
+For PHP:
 
 ```properties
 sonar.php.coverage.reportPaths=coverage/clover.xml
@@ -171,6 +255,31 @@ sonar.php.tests.reportPath=coverage/junit.xml
 ```
 
 Coverage reports must use Clover XML; test execution reports must use PHPUnit's JUnit XML. Reports are imported only when configured, and configured report files must exist inside the repository. Host absolute paths embedded in reports need to be adjusted in the report-generation environment. [SonarQube PHP coverage documentation](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/test-coverage/php-test-coverage)
+
+For Python, configure Coverage.py to retain portable paths (for example in the cloned repository's `.coveragerc`; adjust `src` to the real application source directory):
+
+```ini
+[run]
+relative_files = True
+source = src
+```
+
+Then run these commands **from the cloned repository root**, in an existing development environment that already has pytest and Coverage.py installed:
+
+```bash
+mkdir -p coverage
+coverage run -m pytest -o junit_family=xunit1 --junitxml=coverage/junit.xml
+coverage xml -o coverage/coverage.xml
+```
+
+Then enable these properties in the package's `config/projects/<name>.properties` and scan:
+
+```properties
+sonar.python.coverage.reportPaths=coverage/coverage.xml
+sonar.python.xunit.reportPath=coverage/junit.xml
+```
+
+Python coverage uses Cobertura XML from Coverage.py or pytest-cov. Python test execution uses xUnit XML; `junit_family=xunit1` retains the test file paths needed for detailed result mapping. Configure `sonar.tests` so those paths identify test files. Package validation requires explicit existing report file paths inside the repository; it does not expand report wildcards. Coverage accepts a comma-separated list of files; the xUnit setting accepts one file. These settings are optional for static-only analysis. [Python coverage](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/test-coverage/python-test-coverage), [test execution parameters](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/test-coverage/test-execution-parameters)
 
 The default Sonar Way gate includes coverage expectations for new code. A static-only scan can therefore report a failed gate; the normal scan command still succeeds when analysis and publication complete.
 
@@ -185,11 +294,11 @@ flowchart LR
     Tools --> State[".state · credentials, cache, scan output"]
 ```
 
-PostgreSQL data and SonarQube data, logs, and extensions use named Docker volumes. Cloned sources and configuration are mounted read-only. Each scan has a separate working directory under `.state/scans/`, and gate status is checked against the submitted task's exact analysis ID.
+PostgreSQL data and SonarQube data, logs, and extensions use named volumes in the selected engine. Cloned sources and configuration are mounted read-only. Each scan has a separate working directory under the selected engine's state directory (`.state/scans/` or `.state/podman/scans/`), and gate status is checked against the submitted task's exact analysis ID.
 
 Generated secrets are held under `.state/` with directory mode `0700` and secret-file mode `0600`. Normal setup and scan logs redact stored credentials; only the explicit `credentials` command displays the UI password. Revoked/expired project tokens are replaced on the next scan, while valid tokens are reused.
 
-Keep `.state/` and the matching Docker volumes together when backing up or moving an installation. `.state/stack-name` records its Compose namespace. Losing state while retaining the database loses the generated credentials; restore matching state or intentionally reset the installation.
+Keep `.state/` and each selected engine's matching volumes together when backing up or moving an installation. `.state/stack-name` records Docker's Compose namespace; `.state/podman/stack-name` records Podman's. Losing state while retaining the database loses the generated credentials; restore matching state or intentionally reset that engine's installation.
 
 Pinned components:
 
@@ -204,13 +313,24 @@ The tools Dockerfile adds Git and Python from Ubuntu's repositories. Java, Pytho
 
 ## Troubleshooting
 
-- **Docker is not running:** start Docker Desktop or Docker Engine and retry.
-- **Startup timeout:** run `./sonar logs`. Check Docker RAM/disk, Elasticsearch kernel limits, and matching state/database credentials. A longer timeout helps slow first startups.
+- **Engine is not running:** start Docker Desktop / Docker Engine or the selected Podman machine. Include `--engine podman` in subsequent Podman commands.
+- **Podman Compose unavailable:** install a provider and check `podman compose version`. Use `PODMAN_COMPOSE_PROVIDER` to select the provider; for a Docker Compose provider on Linux, ensure Podman's API socket is running.
+- **Registry credential-helper errors:** check the selected engine's registry authentication settings. The pinned images are public. To avoid invoking an unrelated cloud credential helper for these public pulls, you can use an isolated empty configuration without changing existing credentials:
+
+  ```bash
+  mkdir -p .state/podman/registry
+  printf '{"auths": {}}\n' > .state/podman/registry/config.json
+  DOCKER_CONFIG="$PWD/.state/podman/registry" \
+  REGISTRY_AUTH_FILE="$PWD/.state/podman/registry/config.json" \
+    ./sonar --engine podman scan my-app
+  ```
+
+- **Startup timeout:** run `./sonar logs` with the same engine option. Check engine RAM/disk, Elasticsearch kernel limits, and matching state/database credentials. A longer timeout helps slow first startups.
 - **Port already allocated:** choose another `SONAR_PORT` and use it consistently.
-- **No PHP files selected:** check `sonar.sources`, inclusions, and exclusions. Replace WordPress template placeholders with real owned directories.
+- **No PHP or Python files selected:** check `sonar.sources`, inclusions, and exclusions. An older PHP-only inclusion override must include `**/*.py` to scan Python. Replace WordPress template placeholders with real owned directories.
 - **Missing coverage/test report:** generate it before scanning, or remove the optional report property.
 - **Source/cache permission error:** ensure the local user can read the repository. Tools run as the invoking user's UID/GID; scanner writes go to `.state/`.
-- **Administrator password changed through the UI:** update `admin_password` in `.state/credentials.json` to match, preserving the rest of the file and its permissions, or restore matching state.
+- **Administrator password changed through the UI:** update `admin_password` in the selected engine's `credentials.json` (`.state/` for Docker; `.state/podman/` for Podman) to match, preserving the rest of the file and its permissions, or restore matching state.
 - **Processing timeout:** publication may already have completed. Check the dashboard and logs; increase `SONAR_ANALYSIS_TIMEOUT` for future scans.
 - **Interrupted command:** retry it. Saved password changes and orphaned tokens are recovered without resetting project history.
 - **Lock has no owner:** once you have confirmed no package command is running, remove `.state/lock` and retry.
@@ -222,15 +342,17 @@ Syntax/configuration and standard-library unit tests:
 ```bash
 bash -n sonar
 docker compose --profile tools config --quiet
+docker compose -f compose.yaml -f compose.podman.yaml --profile tools config --quiet
 python3 -m unittest discover -s tests -v
 ```
 
-Run the real Docker smoke suite after satisfying the host prerequisites:
+Run the real smoke suite for each installed engine after satisfying its host/VM prerequisites:
 
 ```bash
 python3 tests/smoke.py
+python3 tests/smoke.py --engine podman
 ```
 
-The suite copies the package into an isolated temporary folder, uses its own local port and Compose namespace, and creates three committed fixture repositories. It verifies private projects, coverage/test imports, exclusions, gate modes, token recovery, persistent history across restart, unchanged source/Git files, and reset preservation. It deletes its own volumes/state afterward. If cleanup fails, it preserves and reports the temporary workspace so cleanup can be retried.
+The suite copies the package into an isolated temporary folder, uses its own local port and Compose namespace, and creates five committed fixture repositories covering PHP, WordPress, Python, and mixed PHP/Python code. It verifies private projects, PHP and Python coverage/test imports, dependency exclusions, gate modes, token recovery, persistent history across restart, HTML/CSV exports, unchanged source/Git files, and reset preservation. It deletes its own volumes/state afterward. If cleanup fails, it preserves and reports the temporary workspace so cleanup can be retried.
 
-For release validation, run this suite on native macOS ARM64 and native Linux AMD64. The GitHub workflow runs the native Linux checks when the repository is hosted there.
+For release validation, run this suite with both engines on native macOS ARM64 and native Linux AMD64. The GitHub workflow has Docker and Podman Linux jobs (the Podman job uses the rootful CLI provider on its dedicated runner); it runs when the repository is hosted there.

@@ -4,23 +4,27 @@ set -euo pipefail
 umask 077
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-STATE="$ROOT/.state"
+STATE_ROOT="$ROOT/.state"
+LOCK="$STATE_ROOT/lock"
 LOCK_HELD=false
 
 usage() {
     cat <<'EOF'
-Usage: ./sonar COMMAND
+Usage: ./sonar [--engine docker|podman] COMMAND
 
   up                         Start and initialize SonarQube
-  scan NAME [--check-gate]    Scan projects/NAME
+  scan NAME [--check-gate]    Scan PHP/Python code in projects/NAME
   scan --all [--check-gate]   Scan every repository sequentially
   report NAME                Export HTML summary and CSV findings
   status                     Show service and server status
   logs [sonarqube|postgres]   Show the latest 100 service log lines
   credentials                Display the local web login
   down                       Stop services and preserve data
-  reset --yes                Delete package data; preserve repositories/config
+  reset --yes                Delete selected engine data; preserve clones/config
   help                       Show this help
+
+Docker is the default engine. SONAR_ENGINE=podman also selects Podman.
+Use SONAR_PORT=9001 when both engines' stacks will run together.
 
 Environment: SONAR_PORT (9000), SONAR_STARTUP_TIMEOUT (300 seconds),
 SONAR_ANALYSIS_TIMEOUT (300 seconds), SONAR_SCAN_TIMEOUT (1800 seconds),
@@ -29,6 +33,22 @@ EOF
 }
 
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+ENGINE=${SONAR_ENGINE:-docker}
+case "${1:-}" in
+    --engine)
+        [ "$#" -ge 2 ] || fail "--engine requires docker or podman."
+        ENGINE=$2
+        shift 2
+        ;;
+    --engine=*) ENGINE=${1#--engine=}; shift ;;
+esac
+case "$ENGINE" in docker|podman) ;; *) fail "Unknown engine: $ENGINE. Choose docker or podman." ;; esac
+export SONAR_ENGINE="$ENGINE"
+CLI="./sonar"
+if [ "$ENGINE" = podman ]; then CLI="$CLI --engine podman"; fi
+STATE="$STATE_ROOT"
+if [ "$ENGINE" = podman ]; then STATE="$STATE_ROOT/podman"; fi
 
 COMMAND=${1:-help}
 case "$COMMAND" in
@@ -52,19 +72,56 @@ case "$COMMAND" in
     *) usage >&2; fail "Unknown command: $COMMAND" ;;
 esac
 
-command -v docker >/dev/null 2>&1 || fail "Install Docker with the Docker Compose plugin."
-docker compose version >/dev/null 2>&1 || fail "Docker Compose is unavailable. Install the Docker Compose plugin."
-docker info >/dev/null 2>&1 || fail "Docker is not running. Start Docker Desktop, or your Docker Engine, and retry."
-
-# Bind mounts and localhost URLs require the daemon to be on this machine.
-DOCKER_ENDPOINT=${DOCKER_HOST:-}
-if [ -z "$DOCKER_ENDPOINT" ]; then
-    DOCKER_ENDPOINT=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
+if [ "$ENGINE" = docker ]; then
+    command -v docker >/dev/null 2>&1 || fail "Install Docker with the Docker Compose plugin."
+    docker compose version >/dev/null 2>&1 || fail "Docker Compose is unavailable. Install the Docker Compose plugin."
+    docker info >/dev/null 2>&1 || fail "Docker is not running. Start Docker Desktop, or your Docker Engine, and retry."
+    # Bind mounts and localhost URLs require a local engine.
+    DOCKER_ENDPOINT=${DOCKER_HOST:-}
+    if [ -z "$DOCKER_ENDPOINT" ]; then
+        DOCKER_ENDPOINT=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
+    fi
+    case "$DOCKER_ENDPOINT" in
+        unix://*) ;;
+        *) fail "Use a local Docker context with a Unix socket; remote Docker hosts are unsupported." ;;
+    esac
+else
+    command -v podman >/dev/null 2>&1 || fail "Install Podman and a Compose provider (docker-compose or podman-compose)."
+    podman info >/dev/null 2>&1 || fail "Podman is not running. On macOS, initialize/start a Podman machine; on Linux, check podman info."
+    PODMAN_ENDPOINT=${CONTAINER_HOST:-}
+    PODMAN_MACHINE=false
+    REMOTE=$(podman info --format '{{.Host.ServiceIsRemote}}')
+    case "$REMOTE" in true|false) ;; *) fail "Cannot determine Podman's connection mode from podman info." ;; esac
+    CONNECTIONS=''
+    # Native Linux Podman can have saved SSH connections that it is not using.
+    if [ "$REMOTE" = true ] || [ -n "${CONTAINER_HOST:-}${CONTAINER_CONNECTION:-}" ]; then
+        CONNECTIONS=$(podman system connection list --format '{{.Name}}\t{{.URI}}\t{{.Default}}\t{{.IsMachine}}')
+    fi
+    while IFS=$'\t' read -r connection uri is_default is_machine; do
+        if [ -n "${CONTAINER_HOST:-}" ]; then
+            if [ "$uri" = "$CONTAINER_HOST" ]; then PODMAN_MACHINE=$is_machine; fi
+        else
+            if { [ -n "${CONTAINER_CONNECTION:-}" ] && [ "$connection" = "$CONTAINER_CONNECTION" ]; } ||
+               { [ -z "${CONTAINER_CONNECTION:-}" ] && [ "$is_default" = true ]; }; then
+                PODMAN_ENDPOINT=$uri
+                PODMAN_MACHINE=$is_machine
+            fi
+        fi
+    done <<< "$CONNECTIONS"
+    if [ -n "${CONTAINER_CONNECTION:-}" ] && [ -z "$PODMAN_ENDPOINT" ]; then
+        fail "Cannot resolve the selected Podman connection. Check podman system connection list."
+    fi
+    case "$PODMAN_ENDPOINT" in
+        ''|unix://*) ;;
+        ssh://*@127.0.0.1:*|ssh://*@localhost:*)
+            [ "$PODMAN_MACHINE" = true ] || fail "Use local Podman or a local Podman machine; remote Podman hosts are unsupported."
+            ;;
+        *) fail "Use local Podman or a local Podman machine; remote Podman hosts are unsupported." ;;
+    esac
+    # Do not let an inherited Docker context redirect the external Compose provider.
+    unset DOCKER_HOST DOCKER_CONTEXT
+    podman compose version >/dev/null 2>&1 || fail "Podman Compose is unavailable. Install docker-compose or podman-compose, or set PODMAN_COMPOSE_PROVIDER."
 fi
-case "$DOCKER_ENDPOINT" in
-    unix://*) ;;
-    *) fail "Use a local Docker context with a Unix socket; remote Docker hosts are unsupported." ;;
-esac
 
 SONAR_PORT=${SONAR_PORT:-9000}
 case "$SONAR_PORT" in ''|*[!0-9]*) fail "SONAR_PORT must be an integer between 1 and 65535." ;; esac
@@ -72,15 +129,28 @@ case "$SONAR_PORT" in ''|*[!0-9]*) fail "SONAR_PORT must be an integer between 1
 export SONAR_PORT
 export SONAR_UID=$(id -u)
 export SONAR_GID=$(id -g)
+if [ "$ENGINE" = podman ]; then
+    ROOTLESS=$(podman info --format '{{.Host.Security.Rootless}}')
+    case "$ROOTLESS" in
+        true) export SONAR_PODMAN_USERNS="keep-id:uid=$SONAR_UID,gid=$SONAR_GID" ;;
+        false) export SONAR_PODMAN_USERNS=host ;;
+        *) fail "Cannot determine Podman's user namespace mapping from podman info." ;;
+    esac
+fi
 
+[ ! -L "$STATE_ROOT" ] || fail ".state must be a directory, not a symbolic link."
 [ ! -L "$STATE" ] || fail ".state must be a directory, not a symbolic link."
 mkdir -p "$STATE"
+chmod 700 "$STATE_ROOT"
 chmod 700 "$STATE"
+export SONAR_STATE_PATH="$STATE"
 
 cleanup() {
     if [ "$LOCK_HELD" = true ]; then
-        rm -f "$STATE/lock/pid"
-        rmdir "$STATE/lock" 2>/dev/null || true
+        rm -f "$LOCK/pid"
+        rmdir "$LOCK" 2>/dev/null || true
+        rmdir "$STATE_ROOT" 2>/dev/null || true
+        LOCK_HELD=false
     fi
 }
 trap cleanup EXIT
@@ -88,21 +158,21 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for attempt in 1 2 3; do
-    if mkdir "$STATE/lock" 2>/dev/null; then
-        printf '%s\n' "$$" > "$STATE/lock/pid"
+    if mkdir "$LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK/pid"
         LOCK_HELD=true
         break
     fi
     OWNER=''
-    if [ -f "$STATE/lock/pid" ]; then IFS= read -r OWNER < "$STATE/lock/pid" || true; fi
+    if [ -f "$LOCK/pid" ]; then IFS= read -r OWNER < "$LOCK/pid" || true; fi
     case "$OWNER" in
         ''|*[!0-9]*) sleep 1 ;;
         *)
             if kill -0 "$OWNER" 2>/dev/null; then
                 fail "Another package operation is running (PID $OWNER). Retry when it finishes."
             fi
-            rm -f "$STATE/lock/pid"
-            rmdir "$STATE/lock" 2>/dev/null || true
+            rm -f "$LOCK/pid"
+            rmdir "$LOCK" 2>/dev/null || true
             ;;
     esac
 done
@@ -110,10 +180,14 @@ done
 
 if [ ! -f "$STATE/stack-name" ]; then
     ROOT_CHECKSUM=$(printf '%s' "$ROOT" | cksum)
-    printf 'sonar-package-%s\n' "${ROOT_CHECKSUM%% *}" > "$STATE/stack-name"
+    SUFFIX=''
+    if [ "$ENGINE" = podman ]; then SUFFIX=-podman; fi
+    printf 'sonar-package-%s%s\n' "${ROOT_CHECKSUM%% *}" "$SUFFIX" > "$STATE/stack-name"
 fi
 IFS= read -r STACK_NAME < "$STATE/stack-name"
 case "$STACK_NAME" in ''|*[!a-z0-9_-]*) fail "Invalid saved stack name in .state/stack-name." ;; esac
+export SONAR_TOOLS_IMAGE="$STACK_NAME-tools"
+if [ "$ENGINE" = podman ]; then export SONAR_TOOLS_IMAGE="localhost/$SONAR_TOOLS_IMAGE"; fi
 
 # This file is generated by the container helper. Parse only its known variable;
 # never execute a state file as shell code.
@@ -130,11 +204,20 @@ load_database_password() {
 load_database_password
 
 compose() {
-    docker compose --project-directory "$ROOT" --file "$ROOT/compose.yaml" \
-        --project-name "$STACK_NAME" --env-file "$STATE/runtime.env" "$@"
+    local files=(--file "$ROOT/compose.yaml")
+    if [ "$ENGINE" = podman ]; then files+=(--file "$ROOT/compose.podman.yaml"); fi
+    "$ENGINE" compose --project-directory "$ROOT" "${files[@]}" \
+        --project-name "$STACK_NAME" --env-file "$STATE/runtime.env" --profile tools "$@"
 }
 tools() { compose run --rm --no-deps -T tools "$@"; }
-build_tools() { compose build --quiet tools; }
+build_tools() {
+    if [ "$ENGINE" = podman ]; then
+        # Buildah builds directly; external Compose providers need not implement builds.
+        podman build --format docker --quiet --tag "$SONAR_TOOLS_IMAGE" --file "$ROOT/Dockerfile" "$ROOT"
+    else
+        compose build --quiet tools
+    fi
+}
 
 case "$COMMAND" in
     up|scan)
@@ -149,12 +232,12 @@ case "$COMMAND" in
         if [ "$COMMAND" = scan ]; then tools scan "${@:2}"; fi
         ;;
     credentials)
-        [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run ./sonar up first."
+        [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run $CLI up first."
         build_tools
         tools credentials
         ;;
     report)
-        [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run ./sonar scan NAME first."
+        [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run $CLI scan NAME first."
         build_tools
         tools report "$2"
         ;;
@@ -164,7 +247,7 @@ case "$COMMAND" in
             build_tools
             tools status
         else
-            printf 'Not initialized. Run ./sonar up or ./sonar scan NAME.\n'
+            printf 'Not initialized. Run %s up or %s scan NAME.\n' "$CLI" "$CLI"
         fi
         ;;
     logs)
@@ -173,8 +256,16 @@ case "$COMMAND" in
     down) compose down ;;
     reset)
         compose down --volumes --remove-orphans
-        rm -rf "$STATE"
-        LOCK_HELD=false
-        printf 'Package data and credentials removed. Repositories and configuration preserved.\n'
+        if [ "$ENGINE" = podman ]; then
+            rm -rf "$STATE"
+        else
+            # Docker's original .state layout stays compatible. Preserve Podman data.
+            for entry in "$STATE"/* "$STATE"/.[!.]* "$STATE"/..?*; do
+                case "$entry" in "$STATE/podman"|"$LOCK") continue ;; esac
+                if [ -e "$entry" ] || [ -L "$entry" ]; then rm -rf "$entry"; fi
+            done
+        fi
+        cleanup
+        printf '%s package data and credentials removed. Repositories, configuration, and the other engine preserved.\n' "$ENGINE"
         ;;
 esac

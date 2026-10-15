@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Container-side setup and scanning. Uses only the Python standard library."""
+"""Container-side setup and scanning for PHP/Python. Uses only the standard library."""
 
 from __future__ import annotations
 
@@ -315,6 +315,7 @@ class SonarPackage:
         self.projects = Path(projects_dir or os.environ.get("SONAR_PROJECTS_DIR", "/projects"))
         self.config = Path(config_dir or os.environ.get("SONAR_CONFIG_DIR", "/config"))
         self.api_url = api_url
+        self.cli = "./sonar --engine podman" if os.environ.get("SONAR_ENGINE") == "podman" else "./sonar"
         try:
             port = int(os.environ.get("SONAR_PORT", "9000"))
         except ValueError as error:
@@ -337,10 +338,10 @@ class SonarPackage:
             try:
                 value = int((Path(sysctl_dir) / relative).read_text().strip())
             except (ValueError, OSError) as error:
-                raise PackageError("Cannot check Docker host prerequisite " + name + ". See README.md.") from error
+                raise PackageError("Cannot check container host prerequisite " + name + ". See README.md.") from error
             if value < minimum:
-                raise PackageError("Docker host " + name + "=" + str(value) + " is below " + str(minimum)
-                                   + ". Set it on the Linux Docker host or Docker Desktop's Linux VM; "
+                raise PackageError("Container host " + name + "=" + str(value) + " is below " + str(minimum)
+                                   + ". Set it on the Linux container host or the Docker/Podman Linux VM; "
                                    "see README.md. No host settings were changed.")
 
     def wait_ready(self):
@@ -365,7 +366,7 @@ class SonarPackage:
                 next_notice = now + 30
                 last_status = status
             time.sleep(min(2, max(0, deadline - now)))
-        raise PackageError("SonarQube startup timed out. Run ./sonar logs; check Docker resources, "
+        raise PackageError("SonarQube startup timed out. Run " + self.cli + " logs; check container-engine resources, "
                            "Linux Elasticsearch limits, and matching database credentials.")
 
     def bootstrap(self):
@@ -392,14 +393,14 @@ class SonarPackage:
                            ("sonar.forceAuthentication", "true")):
             client.request("api/settings/set", {"key": key, "value": value}, post=True)
         print("SonarQube is ready at " + self.web_url + ".", flush=True)
-        print("Use ./sonar credentials to retrieve the web login.", flush=True)
+        print("Use " + self.cli + " credentials to retrieve the web login.", flush=True)
 
     def names(self, name=None, all_projects=False):
         if all_projects:
             names = sorted(path.name for path in self.projects.iterdir()
                            if path.is_dir() and not path.name.startswith("."))
             if not names:
-                raise PackageError("No repositories found. Clone PHP code into projects/<name>/ first.")
+                raise PackageError("No repositories found. Clone PHP or Python code into projects/<name>/ first.")
         elif name:
             names = [name]
         else:
@@ -460,18 +461,23 @@ class SonarPackage:
                     exclusions.append(relative + "/**" if path.is_dir() else relative)
             properties["sonar.exclusions"] = ",".join(dict.fromkeys(exclusions))
         for key in ("sonar.php.coverage.reportPaths", "sonar.php.tests.reportPath",
+                    "sonar.python.coverage.reportPaths", "sonar.python.xunit.reportPath",
                     "sonar.coverageReportPaths", "sonar.testExecutionReportPaths"):
             if key not in properties:
                 continue
             reports = comma_values(properties[key])
-            if not reports or (key == "sonar.php.tests.reportPath" and len(reports) != 1):
+            if not reports or (key in ("sonar.php.tests.reportPath", "sonar.python.xunit.reportPath")
+                               and len(reports) != 1):
                 raise PackageError("Invalid report path configuration: " + key)
             for value in reports:
                 if not self.repository_path(repository, value, key).is_file():
                     raise PackageError(key + " must point to a report file: " + value)
         inclusions = comma_values(properties.get("sonar.inclusions", ""))
         exclusions = comma_values(properties.get("sonar.exclusions", ""))
-        suffixes = comma_values(properties.get("sonar.php.file.suffixes", ".php,.php3,.php4,.php5,.phtml,.inc"))
+        suffixes = {suffix.lower() for key, default in (
+            ("sonar.php.file.suffixes", ".php,.php3,.php4,.php5,.phtml,.inc"),
+            ("sonar.python.file.suffixes", ".py"),
+        ) for suffix in comma_values(properties.get(key, default))}
         found = False
         for source in sources:
             paths = source.rglob("*") if source.is_dir() else [source]
@@ -490,7 +496,7 @@ class SonarPackage:
             if found:
                 break
         if not found:
-            raise PackageError("No PHP source files selected in projects/" + name + ". Check source paths and exclusions.")
+            raise PackageError("No PHP or Python source files selected in projects/" + name + ". Check source paths and exclusions.")
         return properties
 
     def validate(self, names):
@@ -575,7 +581,7 @@ class SonarPackage:
                 task = client.request("api/ce/task", {"id": task_id}).get("task", {})
                 status = task.get("status")
                 if status in ("FAILED", "CANCELED"):
-                    detail = self.state.redact(str(task.get("errorMessage", "Check ./sonar logs.")))
+                    detail = self.state.redact(str(task.get("errorMessage", "Check " + self.cli + " logs.")))
                     raise PackageError("SonarQube analysis " + status.lower() + ": " + detail)
                 if status == "SUCCESS":
                     analysis_id = task.get("analysisId")
@@ -593,7 +599,7 @@ class SonarPackage:
                     raise
             time.sleep(min(2, max(0, deadline - time.monotonic())))
         raise PackageError("Analysis processing timed out. Results may appear later in the dashboard; "
-                           "check ./sonar logs or increase SONAR_ANALYSIS_TIMEOUT.")
+                           "check " + self.cli + " logs or increase SONAR_ANALYSIS_TIMEOUT.")
 
     def scan_one(self, name):
         properties = self.properties(name)
@@ -645,7 +651,7 @@ class SonarPackage:
     def credentials(self):
         data = self.state.require()
         if not data["admin_initialized"]:
-            raise PackageError("Initial setup has not completed. Run ./sonar up again before retrieving the web login.")
+            raise PackageError("Initial setup has not completed. Run " + self.cli + " up again before retrieving the web login.")
         print("Web interface: " + self.web_url)
         print("Username: admin")
         print("Password: " + data["admin_password"])
@@ -657,7 +663,7 @@ class SonarPackage:
             raise PackageError("Invalid project folder name.")
         data = self.state.require()
         if not data["admin_initialized"]:
-            raise PackageError("Initial setup has not completed. Run ./sonar up first.")
+            raise PackageError("Initial setup has not completed. Run " + self.cli + " up first.")
         try:
             report = Exporter(self.client(), "local:" + name, self.web_url,
                               positive_timeout("SONAR_REPORT_TIMEOUT", "600")).collect()
@@ -668,7 +674,8 @@ class SonarPackage:
                                       ("issues.csv", finding_csv(report)),
                                       ("security-hotspots.csv", finding_csv(report, hotspot=True))):
                 atomic_write(directory / filename, self.state.redact(content))
-            print("Report: .state/" + str(directory.relative_to(self.state.directory)) + "/index.html")
+            prefix = ".state/podman/" if os.environ.get("SONAR_ENGINE") == "podman" else ".state/"
+            print("Report: " + prefix + str(directory.relative_to(self.state.directory)) + "/index.html")
             print("CSV files: issues.csv and security-hotspots.csv in the same folder.")
         except ExportError as error:
             raise PackageError(str(error)) from error

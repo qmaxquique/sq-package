@@ -1,0 +1,8 @@
+# Loaded by ./sonar only for --engine podman.
+services:
+  tools:
+    userns_mode: ${SONAR_PODMAN_USERNS:-keep-id}
+    # Keep the clones' host SELinux labels unchanged (no :z/:Z relabeling).
+    # Source/config mounts remain read-only; server containers retain defaults.
+    security_opt:
+      - label=disable
