@@ -180,6 +180,26 @@ Invoke `$sq` with requests such as “analyze this checkout,” “set up local 
 
 Ordinary analysis imports existing reports and returns HTML/CSV plus findings without changing application code or running its tests. Worktrees are scanned without SCM blame. Separate external checkouts receive stable path-derived names through `skills/codex/sq/scripts/project-name.sh`. The read-only `doctor.sh` checks prerequisites: exit `0` checked, `1` blockers, `2` invalid usage, `3` required checks unverified. Actual package preflight/source validation remains authoritative.
 
+### GitHub Copilot skill: sq
+
+The [Copilot sq skill](skills/copilot/sq/SKILL.md) ports the same setup, scan, report, and recovery workflow to Copilot CLI and VS Code agent mode. It bundles its own helpers/references and uses Copilot's standard `SKILL.md` format. See [Copilot installation and access](skills/copilot/sq/references/copilot.md) for discovery, directory permissions, and remote/cloud session limitations.
+
+Install the complete folder personally from the package root:
+
+```bash
+SQ_COPILOT_SKILLS_DIR="$HOME/.copilot/skills"
+mkdir -p "$SQ_COPILOT_SKILLS_DIR"
+if [ ! -e "$SQ_COPILOT_SKILLS_DIR/sq" ] && [ ! -L "$SQ_COPILOT_SKILLS_DIR/sq" ]; then
+  cp -R "$PWD/skills/copilot/sq" "$SQ_COPILOT_SKILLS_DIR/sq"
+else
+  printf 'Existing sq entry preserved: %s\n' "$SQ_COPILOT_SKILLS_DIR/sq"
+fi
+```
+
+For a single repository, copy the complete folder into that checkout's `.github/skills/sq` instead, preserving any existing entry. These are [Copilot's supported skill locations](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills); `skills/copilot/sq` is the maintained source, not an automatic discovery location.
+
+Invoke `/sq analyze this checkout` or `/sq export the latest report for NAME`. To reuse this package from another project in Copilot CLI, launch from that project's directory with `SQ_PACKAGE_ROOT="/absolute/path/to/sq-package" copilot --add-dir "/absolute/path/to/sq-package"`. The package configuration, engine selection, read-only source handling, and coverage policy are the same as the Codex skill. Remote/cloud sessions operate on their execution host, not the local workstation.
+
 ### Downloadable reports
 
 ```bash

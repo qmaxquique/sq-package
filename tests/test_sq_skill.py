@@ -12,6 +12,8 @@ SCRIPTS = ROOT / "skills" / "codex" / "sq" / "scripts"
 
 
 class DoctorTests(unittest.TestCase):
+    scripts = SCRIPTS
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="sq doctor ")
         self.addCleanup(self.temporary.cleanup)
@@ -68,7 +70,7 @@ case "$2" in vm.max_map_count) printf '%s\n' "${SQ_TEST_MAPS:-524288}" ;; *) pri
         path.chmod(0o755)
 
     def run_doctor(self, engine="podman", source=True):
-        command = ["bash", str(SCRIPTS / "doctor.sh"), "--package", str(self.package), "--engine", engine]
+        command = ["bash", str(self.scripts / "doctor.sh"), "--package", str(self.package), "--engine", engine]
         if source:
             command += ["--source", str(self.source)]
         return subprocess.run(command, env=self.environment, text=True, capture_output=True, timeout=10)
@@ -175,6 +177,8 @@ case "$2" in vm.max_map_count) printf '%s\n' "${SQ_TEST_MAPS:-524288}" ;; *) pri
 
 
 class ProjectNameTests(unittest.TestCase):
+    scripts = SCRIPTS
+
     def test_name_is_stable_canonical_and_distinguishes_checkouts(self):
         with tempfile.TemporaryDirectory(prefix="sq identity ") as temporary:
             root = Path(temporary).resolve()
@@ -186,13 +190,21 @@ class ProjectNameTests(unittest.TestCase):
             alias.symlink_to(first, target_is_directory=True)
 
             def name(path):
-                return subprocess.check_output(["bash", str(SCRIPTS / "project-name.sh"), str(path)], text=True).strip()
+                return subprocess.check_output(["bash", str(self.scripts / "project-name.sh"), str(path)], text=True).strip()
 
             expected = "ext-same-name-" + hashlib.sha256(str(first).encode()).hexdigest()[:12]
             self.assertEqual(name(first), expected)
             self.assertEqual(name(alias), expected)
             self.assertNotEqual(name(first), name(second))
             self.assertRegex(name(first), r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$")
+
+
+class CopilotDoctorTests(DoctorTests):
+    scripts = ROOT / "skills" / "copilot" / "sq" / "scripts"
+
+
+class CopilotProjectNameTests(ProjectNameTests):
+    scripts = ROOT / "skills" / "copilot" / "sq" / "scripts"
 
 
 if __name__ == "__main__":
