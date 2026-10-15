@@ -1,0 +1,12 @@
+# Loaded by ./sonar only for scan NAME --path PATH.
+services:
+  tools:
+    environment:
+      SONAR_EXTERNAL_SOURCE_PATH: ${SONAR_EXTERNAL_SOURCE_PATH:?Select a checkout with --path}
+    volumes:
+      - type: bind
+        source: ${SONAR_EXTERNAL_SOURCE_PATH:?Select a checkout with --path}
+        target: /external-project
+        read_only: true
+        bind:
+          create_host_path: false

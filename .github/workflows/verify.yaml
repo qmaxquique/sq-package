@@ -23,8 +23,11 @@ jobs:
       - name: Check syntax and configuration
         run: |
           bash -n sonar
+          bash -n skills/codex/sq/scripts/doctor.sh skills/codex/sq/scripts/project-name.sh
           docker compose --profile tools config --quiet
           docker compose -f compose.yaml -f compose.podman.yaml --profile tools config --quiet
+          SONAR_EXTERNAL_SOURCE_PATH="$PWD/tests/fixtures/python" SONAR_STATE_PATH="$PWD/.state" SONAR_PROJECTS_PATH="$PWD/.state/empty-projects" docker compose -f compose.yaml -f compose.external.yaml --profile tools config --quiet
+          SONAR_EXTERNAL_SOURCE_PATH="$PWD/tests/fixtures/python" SONAR_STATE_PATH="$PWD/.state/podman" SONAR_PROJECTS_PATH="$PWD/.state/podman/empty-projects" docker compose -f compose.yaml -f compose.podman.yaml -f compose.external.yaml --profile tools config --quiet
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Configure Elasticsearch prerequisites on the test runner

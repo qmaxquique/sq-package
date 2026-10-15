@@ -57,7 +57,12 @@ services:
       SONAR_ENGINE: ${SONAR_ENGINE:-docker}
     volumes:
       - ${SONAR_STATE_PATH:-./.state}:/state
-      - ./projects:/projects:ro
+      - type: bind
+        source: ${SONAR_PROJECTS_PATH:-./projects}
+        target: /projects
+        read_only: true
+        bind:
+          create_host_path: false
       - ./config:/config:ro
     init: true
     command: ["status"]

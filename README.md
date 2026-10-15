@@ -123,6 +123,7 @@ Scans use the current local checkout, including uncommitted edits. The package p
 | --- | --- |
 | `./sonar up` | Start and initialize the stack without scanning. |
 | `./sonar scan my-app` | Analyze one repository and report its gate status. |
+| `./sonar scan my-app --path /path/to/checkout` | Analyze an external local checkout read-only, including current edits. |
 | `./sonar scan --all` | Analyze every repository sequentially. |
 | `./sonar scan my-app --check-gate` | Analyze, then fail the command if the gate does not pass. |
 | `./sonar scan --all --check-gate` | Apply gate enforcement to every repository. |
@@ -138,6 +139,46 @@ Scans use the current local checkout, including uncommitted edits. The package p
 Exit statuses: `0` means completed successfully; `1` means a configuration, scanner, or server error; `2` means a completed analysis failed gate enforcement. A failed gate still publishes results. Without `--check-gate`, gate failure is informational. For `--all`, runtime errors in one project do not prevent the remaining projects from scanning; any runtime error takes precedence over gate failures.
 
 Operations are serialized. If another command is running, finish it before starting a new one. Stale locks with a dead owner are recovered automatically.
+
+### External checkouts
+
+```bash
+./sonar scan external-app --path /absolute/path/to/application
+./sonar report external-app
+```
+
+Relative paths are resolved from the invoking shell's working directory and canonicalized. External scans require one logical name and cannot use `--all`. That name selects `config/projects/<name>.properties` and project `local:<name>`; it cannot shadow a folder in `projects/` or a previously registered different source. The canonical host path is bound to the project in private state. Existing folder-based projects keep their identity and credentials format.
+
+Only the selected checkout is mounted at `/external-project`, read-only; other package clones are hidden for this operation. Nothing is copied into `projects/`, and scanner output remains in `.state/`. Relative source/report paths are resolved within the external checkout; absolute paths embedded in imported XML must match `/external-project/`. Ensure the source path is shared with the selected engine VM.
+
+Linked Git worktrees/submodule checkouts can have Git metadata outside this mount. To scan them without mounting or modifying that metadata, set these properties for the logical project:
+
+```properties
+sonar.scm.disabled=true
+sonar.scm.exclusions.disabled=true
+```
+
+Code analysis and coverage imports still work, but blame and SCM-derived new-code detection are unavailable. Configured exclusions replace Git-ignore filtering in this mode, so retain dependency/cache exclusions and select owned code explicitly.
+
+### Codex skill: sq
+
+The reusable [sq skill](skills/codex/sq/SKILL.md) handles installation discovery, engine choice, prerequisites, scope configuration, scans, reports, and recovery. Install it personally from this repository (run from the package root):
+
+```bash
+SQ_SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
+mkdir -p "$SQ_SKILLS_DIR"
+if [ ! -e "$SQ_SKILLS_DIR/sq" ] && [ ! -L "$SQ_SKILLS_DIR/sq" ]; then
+  ln -s "$PWD/skills/codex/sq" "$SQ_SKILLS_DIR/sq"
+else
+  printf 'Existing sq entry preserved: %s\n' "$SQ_SKILLS_DIR/sq"
+fi
+```
+
+Use another destination by setting `SQ_SKILLS_DIR` appropriately before creating the directory/link. Inspect any existing `sq` entry before installation; do not replace an unrelated skill. The symlink keeps the skill aligned with this checkout. Codex's skill installer can also install the `skills/codex/sq` folder from this repository; a copied installation locates or provisions its package separately.
+
+Invoke `$sq` with requests such as “analyze this checkout,” “set up local SonarQube,” or “export the latest report.” It asks for an engine on first setup and remembers it, alongside engine-specific ports, in Git-ignored `config/sq.local.properties`. `SQ_PACKAGE_ROOT` explicitly selects a package installation. The skill supplies those settings to the wrapper; the wrapper's default remains Docker.
+
+Ordinary analysis imports existing reports and returns HTML/CSV plus findings without changing application code or running its tests. Worktrees are scanned without SCM blame. Separate external checkouts receive stable path-derived names through `skills/codex/sq/scripts/project-name.sh`. The read-only `doctor.sh` checks prerequisites: exit `0` checked, `1` blockers, `2` invalid usage, `3` required checks unverified. Actual package preflight/source validation remains authoritative.
 
 ### Downloadable reports
 
@@ -353,6 +394,6 @@ python3 tests/smoke.py
 python3 tests/smoke.py --engine podman
 ```
 
-The suite copies the package into an isolated temporary folder, uses its own local port and Compose namespace, and creates five committed fixture repositories covering PHP, WordPress, Python, and mixed PHP/Python code. It verifies private projects, PHP and Python coverage/test imports, dependency exclusions, gate modes, token recovery, persistent history across restart, HTML/CSV exports, unchanged source/Git files, and reset preservation. It deletes its own volumes/state afterward. If cleanup fails, it preserves and reports the temporary workspace so cleanup can be retried.
+The suite copies the package into an isolated temporary folder, uses its own local port and Compose namespace, and creates five committed fixture repositories covering PHP, WordPress, Python, and mixed PHP/Python code, plus an external dirty checkout and a linked worktree. It verifies private projects, PHP and Python coverage/test imports, dependency exclusions, gate modes, token recovery, persistent history across restart, external source bindings, HTML/CSV exports, unchanged source/Git files, and reset preservation. It deletes its own volumes/state afterward. If cleanup fails, it preserves and reports the temporary workspace so cleanup can be retried.
 
 For release validation, run this suite with both engines on native macOS ARM64 and native Linux AMD64. The GitHub workflow has Docker and Podman Linux jobs (the Podman job uses the rootful CLI provider on its dedicated runner); it runs when the repository is hosted there.

@@ -14,6 +14,7 @@ Usage: ./sonar [--engine docker|podman] COMMAND
 
   up                         Start and initialize SonarQube
   scan NAME [--check-gate]    Scan PHP/Python code in projects/NAME
+  scan NAME --path PATH      Scan an external checkout read-only
   scan --all [--check-gate]   Scan every repository sequentially
   report NAME                Export HTML summary and CSV findings
   status                     Show service and server status
@@ -51,13 +52,51 @@ STATE="$STATE_ROOT"
 if [ "$ENGINE" = podman ]; then STATE="$STATE_ROOT/podman"; fi
 
 COMMAND=${1:-help}
+SCAN_PATH=''
+SCAN_NAME=''
+SCAN_ALL=false
+CHECK_GATE=false
+unset SONAR_EXTERNAL_SOURCE_PATH SONAR_PROJECTS_PATH
 case "$COMMAND" in
     help|-h|--help) usage; exit 0 ;;
     up|status|credentials|down)
         [ "$#" -eq 1 ] || fail "$COMMAND takes no arguments."
         ;;
     scan)
-        [ "$#" -ge 2 ] || fail "Use ./sonar scan NAME or ./sonar scan --all."
+        scan_arguments=("${@:2}")
+        index=0
+        while [ "$index" -lt "${#scan_arguments[@]}" ]; do
+            argument=${scan_arguments[$index]}
+            case "$argument" in
+                --path)
+                    [ -z "$SCAN_PATH" ] || fail "Specify --path only once."
+                    index=$((index + 1))
+                    [ "$index" -lt "${#scan_arguments[@]}" ] || fail "--path requires a directory."
+                    SCAN_PATH=${scan_arguments[$index]}
+                    [ -n "$SCAN_PATH" ] || fail "--path requires a directory."
+                    ;;
+                --all) SCAN_ALL=true ;;
+                --check-gate) CHECK_GATE=true ;;
+                -*) fail "Unknown scan option: $argument" ;;
+                *) [ -z "$SCAN_NAME" ] || fail "Specify only one project name."; SCAN_NAME=$argument ;;
+            esac
+            index=$((index + 1))
+        done
+        if [ "$SCAN_ALL" = true ]; then
+            [ -z "$SCAN_NAME$SCAN_PATH" ] || fail "--all cannot be combined with a name or --path."
+            scan_arguments=(--all)
+        else
+            [[ "$SCAN_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$ ]] || fail "Specify a valid project name (maximum 200 characters)."
+            scan_arguments=("$SCAN_NAME")
+        fi
+        if [ -n "$SCAN_PATH" ]; then
+            [ -d "$SCAN_PATH" ] && [ -r "$SCAN_PATH" ] && [ -x "$SCAN_PATH" ] || fail "--path must be an existing, readable directory."
+            [ ! -e "$ROOT/projects/$SCAN_NAME" ] && [ ! -L "$ROOT/projects/$SCAN_NAME" ] || fail "An external project name cannot shadow projects/$SCAN_NAME. Choose another name."
+            SCAN_PATH=$(cd -- "$SCAN_PATH" && pwd -P)
+            export SONAR_EXTERNAL_SOURCE_PATH="$SCAN_PATH"
+            scan_arguments+=(--path /external-project)
+        fi
+        if [ "$CHECK_GATE" = true ]; then scan_arguments+=(--check-gate); fi
         ;;
     report)
         [ "$#" -eq 2 ] || fail "Use ./sonar report NAME."
@@ -177,6 +216,14 @@ for attempt in 1 2 3; do
     esac
 done
 [ "$LOCK_HELD" = true ] || fail "Cannot acquire .state/lock. If no operation is running, remove the stale lock directory."
+export SONAR_PROJECTS_PATH="$ROOT/projects"
+if [ -n "$SCAN_PATH" ]; then
+    [ ! -L "$STATE/empty-projects" ] || fail "External scan mount directory must not be a symbolic link."
+    mkdir -p "$STATE/empty-projects"
+    # Use one mount definition: some providers append short/long overrides
+    # instead of merging volumes by destination.
+    export SONAR_PROJECTS_PATH="$STATE/empty-projects"
+fi
 
 if [ ! -f "$STATE/stack-name" ]; then
     ROOT_CHECKSUM=$(printf '%s' "$ROOT" | cksum)
@@ -206,8 +253,11 @@ load_database_password
 compose() {
     local files=(--file "$ROOT/compose.yaml")
     if [ "$ENGINE" = podman ]; then files+=(--file "$ROOT/compose.podman.yaml"); fi
-    "$ENGINE" compose --project-directory "$ROOT" "${files[@]}" \
-        --project-name "$STACK_NAME" --env-file "$STATE/runtime.env" --profile tools "$@"
+    if [ -n "$SCAN_PATH" ]; then files+=(--file "$ROOT/compose.external.yaml"); fi
+    # Both providers resolve relative mounts from this directory. podman-compose
+    # does not implement Docker Compose's --project-directory option.
+    (cd "$ROOT" && "$ENGINE" compose "${files[@]}" \
+        --project-name "$STACK_NAME" --env-file "$STATE/runtime.env" --profile tools "$@")
 }
 tools() { compose run --rm --no-deps -T tools "$@"; }
 build_tools() {
@@ -223,13 +273,13 @@ case "$COMMAND" in
     up|scan)
         printf 'Preparing native tools...\n'
         build_tools
-        if [ "$COMMAND" = scan ]; then tools validate "${@:2}"; fi
+        if [ "$COMMAND" = scan ]; then tools validate "${scan_arguments[@]}"; fi
         tools preflight
         tools init
         load_database_password
         compose up -d postgres sonarqube
         tools bootstrap
-        if [ "$COMMAND" = scan ]; then tools scan "${@:2}"; fi
+        if [ "$COMMAND" = scan ]; then tools scan "${scan_arguments[@]}"; fi
         ;;
     credentials)
         [ -f "$STATE/credentials.json" ] || fail "The package is not initialized. Run $CLI up first."
@@ -242,7 +292,9 @@ case "$COMMAND" in
         tools report "$2"
         ;;
     status)
-        compose ps -a
+        # podman-compose has no ps -a flag. Both engines understand Compose's
+        # standard project label and can show running and stopped containers.
+        "$ENGINE" ps --all --filter "label=com.docker.compose.project=$STACK_NAME"
         if [ -f "$STATE/credentials.json" ]; then
             build_tools
             tools status

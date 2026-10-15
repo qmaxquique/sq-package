@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -80,10 +81,16 @@ class State:
                     not isinstance(record.get(field), str) for field in ("key", "token_name", "token")
                 ):
                     raise PackageError("Invalid saved project credentials; restore matching state.")
+                if "source_path" in record and (
+                        not isinstance(record["source_path"], str) or not Path(record["source_path"]).is_absolute()):
+                    raise PackageError("Invalid saved source binding; restore matching state.")
 
     def initialize(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(str(self.directory), 0o700)
+        # Some macOS VM shares rewrite ownership on a container-side chmod,
+        # even when the mode is unchanged. The host wrapper already sets 0700.
+        if stat.S_IMODE(self.directory.stat().st_mode) != 0o700:
+            os.chmod(str(self.directory), 0o700)
         if self.data is None:
             self.data = {
                 "schema_version": 1,
@@ -95,7 +102,8 @@ class State:
             # Save the intended password BEFORE applying it on the server.
             self.save()
         else:
-            os.chmod(str(self.path), 0o600)
+            if stat.S_IMODE(self.path.stat().st_mode) != 0o600:
+                os.chmod(str(self.path), 0o600)
         atomic_write(
             self.directory / "runtime.env",
             "SONAR_DB_PASSWORD=" + self.data["database_password"] + "\n",
@@ -315,6 +323,8 @@ class SonarPackage:
         self.projects = Path(projects_dir or os.environ.get("SONAR_PROJECTS_DIR", "/projects"))
         self.config = Path(config_dir or os.environ.get("SONAR_CONFIG_DIR", "/config"))
         self.api_url = api_url
+        self.external_repository = None
+        self.external_source_path = None
         self.cli = "./sonar --engine podman" if os.environ.get("SONAR_ENGINE") == "podman" else "./sonar"
         try:
             port = int(os.environ.get("SONAR_PORT", "9000"))
@@ -396,6 +406,8 @@ class SonarPackage:
         print("Use " + self.cli + " credentials to retrieve the web login.", flush=True)
 
     def names(self, name=None, all_projects=False):
+        if self.external_repository is not None and (all_projects or not name):
+            raise PackageError("--path requires one project name and cannot be combined with --all.")
         if all_projects:
             names = sorted(path.name for path in self.projects.iterdir()
                            if path.is_dir() and not path.name.startswith("."))
@@ -412,10 +424,30 @@ class SonarPackage:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", current):
                 raise PackageError("Repository names must use letters, digits, dots, underscores, or dashes "
                                    "and start with a letter or digit (maximum 200 characters).")
-            repository = self.projects / current
-            if current not in actual_names or repository.is_symlink() or not repository.is_dir():
+            repository = self.repository(current)
+            if (self.external_repository is None and current not in actual_names) or repository.is_symlink() or not repository.is_dir():
                 raise PackageError("Repository not found, has different capitalization, or is a symbolic link: projects/" + current)
+            if self.external_repository is not None and current in actual_names:
+                raise PackageError("An external project name cannot shadow projects/" + current + ". Choose another name.")
+            self.check_source_binding(current)
         return names
+
+    def select_external(self, path, source_path):
+        repository = Path(path)
+        if not repository.is_absolute() or not repository.is_dir() or repository.is_symlink():
+            raise PackageError("--path must select an existing absolute directory in the tools container.")
+        if not source_path or not Path(source_path).is_absolute():
+            raise PackageError("External scans require the canonical host source path from ./sonar.")
+        self.external_repository = repository.resolve()
+        self.external_source_path = source_path
+
+    def repository(self, name):
+        return self.external_repository if self.external_repository is not None else self.projects / name
+
+    def check_source_binding(self, name):
+        record = (self.state.data or {}).get("projects", {}).get(name)
+        if record is not None and record.get("source_path") != self.external_source_path:
+            raise PackageError("Project " + name + " is bound to a different source. Choose a new name; history was preserved.")
 
     def repository_path(self, repository, value, label):
         if not value or Path(value).is_absolute():
@@ -428,7 +460,8 @@ class SonarPackage:
         return path
 
     def properties(self, name):
-        repository = self.projects / name
+        self.check_source_binding(name)
+        repository = self.repository(name)
         properties = read_properties(self.config / "defaults.properties")
         override = self.config / "projects" / (name + ".properties")
         if override.is_symlink():
@@ -504,8 +537,16 @@ class SonarPackage:
             self.properties(name)
 
     def ensure_project(self, name):
-        client = self.client()
+        self.check_source_binding(name)
+        records = self.state.require()["projects"]
         key = "local:" + name
+        if self.external_source_path is not None and name not in records:
+            # Bind before the first API mutation so interrupted registration cannot
+            # let a different checkout adopt this project's history.
+            records[name] = {"key": key, "token_name": "", "token": "",
+                             "source_path": self.external_source_path}
+            self.state.save()
+        client = self.client()
         existing = client.request("api/projects/search", {"projects": key}).get("components", [])
         if not existing:
             client.request("api/projects/create", {
@@ -531,7 +572,7 @@ class SonarPackage:
         token = response.get("token")
         if not isinstance(token, str) or not token:
             raise PackageError("SonarQube did not return a project analysis token.")
-        self.state.require()["projects"][name] = {"key": key, "token_name": token_name, "token": token}
+        self.state.require()["projects"][name] = dict(record, key=key, token_name=token_name, token=token)
         self.state.save()
         return key, token
 
@@ -617,7 +658,7 @@ class SonarPackage:
         settings = scan_dir / "project.properties"
         atomic_write(settings, write_properties(properties))
         print("\nScanning " + name + " (" + key + ")...", flush=True)
-        self.run_scanner(self.projects / name, settings, token)
+        self.run_scanner(self.repository(name), settings, token)
         report = work / "report-task.txt"
         if not report.is_file():
             raise PackageError("Scanner did not produce a task report; analysis completion cannot be verified.")
@@ -631,6 +672,7 @@ class SonarPackage:
         print("Results: " + url, flush=True)
         atomic_write(scan_dir / "result.json", json.dumps({
             "project_key": key, "task_id": task_id, "quality_gate": gate, "dashboard_url": url,
+            "source_path": self.external_source_path,
         }, indent=2) + "\n")
         return gate
 
@@ -707,6 +749,7 @@ def main(argv=None):
             command.add_argument("name", nargs="?")
             command.add_argument("--all", action="store_true", dest="all_projects")
             command.add_argument("--check-gate", action="store_true")
+            command.add_argument("--path", help="Container source directory; use the host ./sonar wrapper")
         commands.add_parser("report").add_argument("name")
         arguments = parser.parse_args(argv)
         package = SonarPackage()
@@ -723,6 +766,8 @@ def main(argv=None):
         elif arguments.command == "report":
             package.report(arguments.name)
         else:
+            if arguments.path:
+                package.select_external(arguments.path, os.environ.get("SONAR_EXTERNAL_SOURCE_PATH"))
             names = package.names(arguments.name, arguments.all_projects)
             package.validate(names)
             if arguments.command == "scan":

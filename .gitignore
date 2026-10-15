@@ -2,6 +2,7 @@
 projects/*
 !projects/.gitkeep
 config/projects/*.properties
+config/sq.local.properties
 __pycache__/
 *.py[cod]
 .DS_Store

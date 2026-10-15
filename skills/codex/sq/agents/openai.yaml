@@ -1,0 +1,6 @@
+interface:
+  display_name: "sq"
+  short_description: "Set up SonarQube, scan code, and export findings"
+  default_prompt: "Use $sq to analyze this checkout and return its SonarQube gate, reports, and actionable findings."
+policy:
+  allow_implicit_invocation: true

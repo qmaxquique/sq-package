@@ -31,7 +31,7 @@ def main():
     engine = parser.parse_args().engine
     # A path containing spaces also exercises the Bash wrapper's quoting.
     workspace = Path(tempfile.mkdtemp(prefix="sonar smoke "))
-    for name in ("sonar", "compose.yaml", "compose.podman.yaml", "Dockerfile", ".dockerignore"):
+    for name in ("sonar", "compose.yaml", "compose.podman.yaml", "compose.external.yaml", "Dockerfile", ".dockerignore"):
         shutil.copy2(str(ROOT / name), str(workspace / name))
     shutil.copytree(str(ROOT / "scripts"), str(workspace / "scripts"), ignore=shutil.ignore_patterns("__pycache__"))
     (workspace / "config" / "projects").mkdir(parents=True)
@@ -80,7 +80,25 @@ def main():
                         "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Fixture"],
                        check=True, env=environment)
     originals = snapshot(workspace / "projects")
+    external = workspace / "outside checkout"
+    linked = workspace / "linked checkout"
+    subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(workspace / "projects" / "python"), str(external)],
+                   check=True, env=environment)
+    subprocess.run(["git", "-C", str(external), "worktree", "add", "--quiet", "--detach", str(linked)],
+                   check=True, env=environment)
+    for checkout, filename in ((external, "dirty.py"), (linked, "worktree_only.py")):
+        (checkout / "src" / filename).write_text("def local_change():\n    return 'uncommitted'\n")
+    external_name = subprocess.check_output(["bash", str(ROOT / "skills/codex/sq/scripts/project-name.sh"), str(external)], text=True).strip()
+    linked_name = subprocess.check_output(["bash", str(ROOT / "skills/codex/sq/scripts/project-name.sh"), str(linked)], text=True).strip()
+    assert external_name != linked_name
+    for name in (external_name, linked_name):
+        (workspace / "config/projects" / (name + ".properties")).write_text(
+            "sonar.sources=src\nsonar.tests=tests\nsonar.python.coverage.reportPaths=coverage/coverage.xml\n"
+            "sonar.python.xunit.reportPath=coverage/junit.xml\n"
+            + ("sonar.scm.disabled=true\nsonar.scm.exclusions.disabled=true\n" if name == linked_name else ""))
     config_originals = snapshot(workspace / "config")
+    external_originals = snapshot(external)
+    linked_originals = snapshot(linked)
     passed = False
 
     def cli(*arguments, expected=0):
@@ -185,6 +203,18 @@ def main():
         assert credentials() == before_report, "Report changed credentials"
         cli("report", "missing", expected=1)
         cli("scan", "missing", expected=1)
+        for checkout, name, extra_file in ((external, external_name, "src/dirty.py"),
+                                           (linked, linked_name, "src/worktree_only.py")):
+            cli("scan", name, "--path", str(checkout))
+            assert files("local:" + name) == {"src/app.py", extra_file}
+            assert 0 < float(measures("local:" + name, "coverage")["coverage"]) < 100
+            cli("report", name)
+            assert len(list((state / "reports" / name).glob("*/index.html"))) == 1
+            assert credentials()["projects"][name]["source_path"] == str(checkout.resolve())
+        cli("scan", external_name, "--path", str(linked), expected=1)
+        cli("scan", "--all", "--path", str(external), expected=1)
+        assert snapshot(external) == external_originals, "External source or Git metadata changed"
+        assert snapshot(linked) == linked_originals, "Linked worktree or Git metadata changed"
         assert snapshot(workspace / "projects") == originals, "A source or Git file changed"
         assert snapshot(workspace / "config") == config_originals, "Project configuration changed"
 
@@ -192,11 +222,13 @@ def main():
         assert not (workspace / ".state").exists()
         assert snapshot(workspace / "projects") == originals, "Reset removed source files"
         assert snapshot(workspace / "config") == config_originals, "Reset removed configuration"
+        assert snapshot(external) == external_originals, "Reset changed external checkout"
+        assert snapshot(linked) == linked_originals, "Reset changed linked worktree"
         passed = True
         print("Smoke passed with " + engine + " on " + platform.system() + "/" + platform.machine() + ": "
               "5 PHP/Python/mixed projects, coverage/tests import, dependency exclusions, "
               "gate modes, token recovery, restart persistence, "
-              "HTML/CSV export, unchanged sources/Git, and reset preservation.", flush=True)
+              "external dirty checkout, linked worktree, HTML/CSV export, unchanged sources/Git, and reset preservation.", flush=True)
         return 0
     finally:
         cleaned = passed
