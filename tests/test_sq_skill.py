@@ -207,5 +207,13 @@ class CopilotProjectNameTests(ProjectNameTests):
     scripts = ROOT / "skills" / "copilot" / "sq" / "scripts"
 
 
+class ClaudeDoctorTests(DoctorTests):
+    scripts = ROOT / "skills" / "claude" / "sq" / "scripts"
+
+
+class ClaudeProjectNameTests(ProjectNameTests):
+    scripts = ROOT / "skills" / "claude" / "sq" / "scripts"
+
+
 if __name__ == "__main__":
     unittest.main()

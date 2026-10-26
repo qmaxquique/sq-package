@@ -200,6 +200,24 @@ For a single repository, copy the complete folder into that checkout's `.github/
 
 Invoke `/sq analyze this checkout` or `/sq export the latest report for NAME`. To reuse this package from another project in Copilot CLI, launch from that project's directory with `SQ_PACKAGE_ROOT="/absolute/path/to/sq-package" copilot --add-dir "/absolute/path/to/sq-package"`. The package configuration, engine selection, read-only source handling, and coverage policy are the same as the Codex skill. Remote/cloud sessions operate on their execution host, not the local workstation.
 
+### Claude Code skill: sq
+
+The [Claude Code sq skill](skills/claude/sq/SKILL.md) provides the same setup, scan, report, and recovery workflow. It includes its own helpers and references. Read [Claude Code installation and access](skills/claude/sq/references/claude.md) for directory access, sandbox behavior, and remote-session limits.
+
+To install the complete folder personally, run this from the package root. Set `SQ_CLAUDE_SKILLS_DIR` to another destination, such as `TARGET/.claude/skills`, for one project:
+
+```bash
+SQ_CLAUDE_SKILLS_DIR="${SQ_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+mkdir -p "$SQ_CLAUDE_SKILLS_DIR"
+if [ ! -e "$SQ_CLAUDE_SKILLS_DIR/sq" ] && [ ! -L "$SQ_CLAUDE_SKILLS_DIR/sq" ]; then
+  cp -R "$PWD/skills/claude/sq" "$SQ_CLAUDE_SKILLS_DIR/sq"
+else
+  printf 'Existing sq entry preserved: %s\n' "$SQ_CLAUDE_SKILLS_DIR/sq"
+fi
+```
+
+Claude Code discovers the copied folder from [its supported skill locations](https://code.claude.com/docs/en/skills). Invoke `/sq set up local SonarQube`, `/sq analyze this checkout`, `/sq export the latest report for NAME`, or `/sq analyze this checkout and enforce the quality gate`. To use an existing package from another checkout, start Claude Code in that checkout with `SQ_PACKAGE_ROOT="/absolute/path/to/sq-package" claude --add-dir "/absolute/path/to/sq-package"`.
+
 ### Downloadable reports
 
 ```bash
